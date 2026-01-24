@@ -1,0 +1,1223 @@
+---
+title: "JULY 1 HYENA CODE FOR MANUSCRIPT"
+author: "Stephanie Mitchell"
+date: "2025-06-21"
+output: html_document
+
+---
+# --- Load Necessary Libraries ---
+```{r setup, include=FALSE}
+# This setup chunk ensures all libraries are loaded quietly.
+knitr::opts_chunk$set(echo = TRUE, warning = FALSE, message = FALSE)
+library(deSolve)
+library(ggplot2)
+library(dplyr)
+library(tidyr)
+library(gridExtra)
+library(knitr)
+library(kableExtra)
+library(RColorBrewer)
+```
+
+# --- Model Function (Defines the ODE System) ---
+```{r}
+# --- Model Function (Defines the ODE System) ---
+anthrax_model_ode <- function(t, state, params) {
+  # Unpack states - ensure names match your initial_state_values exactly
+  S_h <- state["S_h"]; I_h <- state["I_h"]; R_h <- state["R_h"]; 
+  D_h_disease_cumulative <- state["D_h_disease_cumulative"]; Cum_I_h_human <- state["Cum_I_h"] 
+  
+  S_l <- state["S_l"]; I_l <- state["I_l"]; C_l <- state["C_l"]; 
+  D_l_disease_cumulative_L <- state["D_l_disease_cumulative"]; Cum_I_l_livestock <- state["Cum_I_l"] 
+  
+  DeadL_Day1_for_spores <- state["DeadL_Day1_for_spores"]
+  DeadL_Day2_for_spores <- state["DeadL_Day2_for_spores"]
+  
+  S_w <- state["S_w"]; I_w <- state["I_w"]; C_w <- state["C_w"]; 
+  D_w_disease_cumulative_W <- state["D_w_disease_cumulative"]; Cum_I_w_wildlife <- state["Cum_I_w"] 
+  
+  # --- ADD THESE LINES ---
+  DeadW_Day1_for_spores <- state["DeadW_Day1_for_spores"]
+  DeadW_Day2_for_spores <- state["DeadW_Day2_for_spores"]
+  # --- END OF ADDED LINES ---
+  
+  B <- state["B"]
+
+  # Unpack parameters 
+  beta_hl <- params$beta_hl; sigma_h <- params$sigma_h; cfr_h <- params$cfr_h
+  psi_l <- params$psi_l; psi_w <- params$psi_w; LD50_env <- params$LD50_env; n_hill <- params$n_hill
+  mu_l_disease <- params$mu_l_disease; gamma_l <- params$gamma_l
+  mu_w_disease <- params$mu_w_disease; gamma_w <- params$gamma_w
+  theta_spores <- params$theta_spores; delta_B <- params$delta_B; k_delay_spore <- params$k_delay_spore; delta_c <- params$delta_c
+  N_y <- params$N_y; k_pred_l_per_hyena <- params$k_pred_l_per_hyena; k_pred_w_per_hyena <- params$k_pred_w_per_hyena
+  # Hyena scavenging
+  w_carcass_hyena_daily_kg <- params$w_carcass_hyena_daily_kg; mass_l <- params$mass_l; mass_w <- params$mass_w
+  max_scav_frac_per_day <- params$max_scav_frac_per_day
+  gamma_to_spores <- params$gamma_to_spores 
+
+  # Ensure non-negative states 
+  S_h <- max(0, S_h); I_h <- max(0, I_h); R_h <- max(0, R_h)
+  S_l <- max(0, S_l); I_l <- max(0, I_l); C_l <- max(0, C_l)
+  S_w <- max(0, S_w); I_w <- max(0, I_w); C_w <- max(0, C_w)
+  B <- max(0, B)
+  DeadL_Day1_for_spores <- max(0, DeadL_Day1_for_spores); DeadL_Day2_for_spores <- max(0, DeadL_Day2_for_spores)
+  DeadW_Day1_for_spores <- max(0, DeadW_Day1_for_spores); DeadW_Day2_for_spores <- max(0, DeadW_Day2_for_spores)
+
+  # --- Human Dynamics --- 
+  new_I_h_flow = beta_hl * S_h * I_l 
+  leave_I_h_flow = sigma_h * I_h
+  recover_h_flow = (1 - cfr_h) * leave_I_h_flow
+  death_h_disease_flow = cfr_h * leave_I_h_flow
+  
+  dS_h_dt = -new_I_h_flow
+  dI_h_dt = new_I_h_flow - leave_I_h_flow
+  dR_h_dt = recover_h_flow
+  dD_h_disease_cumulative_dt = death_h_disease_flow 
+  dCum_I_h_dt = new_I_h_flow 
+
+  # --- Livestock Dynamics --- 
+ 
+  dose_l = psi_l * B
+  P_inf_l = ifelse(dose_l <= 0 || LD50_env <= 0, 0, (dose_l^n_hill) / (dose_l^n_hill + LD50_env^n_hill)) 
+  if (is.nan(P_inf_l) || !is.finite(P_inf_l)) P_inf_l = 0 
+  new_I_l_env_flow = S_l * P_inf_l
+  dS_l_dt = -new_I_l_env_flow
+
+  predation_I_l_flow = 0
+  if (N_y > 0 && k_pred_l_per_hyena > 0 && I_l > 1e-9) { 
+    if (k_pred_w_per_hyena > 0 && I_w > 1e-9) { 
+      predation_I_l_flow = k_pred_l_per_hyena * N_y * (I_l / (I_l + I_w + 1e-9)) 
+    } else { 
+      predation_I_l_flow = k_pred_l_per_hyena * N_y 
+    }
+  }
+  predation_I_l_flow = min(predation_I_l_flow, I_l) 
+  
+  death_l_disease_flow = mu_l_disease * I_l 
+  recover_l_flow = gamma_l * I_l           
+  
+  total_outflow_I_l = death_l_disease_flow + recover_l_flow + predation_I_l_flow
+  if (total_outflow_I_l > I_l && I_l > 1e-9) { 
+      scale_factor_l = I_l / total_outflow_I_l
+      death_l_disease_flow = death_l_disease_flow * scale_factor_l
+      recover_l_flow = recover_l_flow * scale_factor_l
+      predation_I_l_flow = predation_I_l_flow * scale_factor_l
+  }
+
+  dI_l_dt = new_I_l_env_flow - death_l_disease_flow - recover_l_flow - predation_I_l_flow
+  dD_l_disease_cumulative_L_dt = death_l_disease_flow 
+  dCum_I_l_dt_livestock = new_I_l_env_flow 
+
+  # --- Wildlife Dynamics --- 
+  dose_w = psi_w * B
+  P_inf_w = ifelse(dose_w <= 0 || LD50_env <= 0, 0, (dose_w^n_hill) / (dose_w^n_hill + LD50_env^n_hill)) 
+  if (is.nan(P_inf_w) || !is.finite(P_inf_w)) P_inf_w = 0 
+  new_I_w_env_flow = S_w * P_inf_w
+  dS_w_dt = -new_I_w_env_flow
+
+  predation_I_w_flow = 0
+  if (N_y > 0 && k_pred_w_per_hyena > 0 && I_w > 1e-9) { 
+    if (k_pred_l_per_hyena > 0 && I_l > 1e-9) { 
+      predation_I_w_flow = k_pred_w_per_hyena * N_y * (I_w / (I_l + I_w + 1e-9)) 
+    } else { 
+      predation_I_w_flow = k_pred_w_per_hyena * N_y
+    }
+  }
+  predation_I_w_flow = min(predation_I_w_flow, I_w) 
+  
+  death_w_disease_flow = mu_w_disease * I_w 
+  recover_w_flow = gamma_w * I_w           
+
+  total_outflow_I_w = death_w_disease_flow + recover_w_flow + predation_I_w_flow
+  if (total_outflow_I_w > I_w && I_w > 1e-9) { 
+      scale_factor_w = I_w / total_outflow_I_w
+      death_w_disease_flow = death_w_disease_flow * scale_factor_w
+      recover_w_flow = recover_w_flow * scale_factor_w
+      predation_I_w_flow = predation_I_w_flow * scale_factor_w
+  }
+
+  dI_w_dt = new_I_w_env_flow - death_w_disease_flow - recover_w_flow - predation_I_w_flow
+  dD_w_disease_cumulative_W_dt = death_w_disease_flow 
+  dCum_I_w_dt_wildlife = new_I_w_env_flow 
+
+  # --- Carcass Dynamics & Scavenging ---
+  total_carcass_biomass_scavenged_by_hyenas_potential = N_y * w_carcass_hyena_daily_kg
+  biomass_C_l_available = C_l * mass_l
+  biomass_C_w_available = C_w * mass_w
+  total_biomass_C_available = biomass_C_l_available + biomass_C_w_available
+  
+  scavenged_l_num_rate = 0
+  scavenged_w_num_rate = 0
+  if (total_biomass_C_available > 1e-9 && total_carcass_biomass_scavenged_by_hyenas_potential > 0) {
+    prop_biomass_from_l = ifelse(total_biomass_C_available < 1e-9, 0, biomass_C_l_available / total_biomass_C_available)
+    scavenged_l_biomass_rate = total_carcass_biomass_scavenged_by_hyenas_potential * prop_biomass_from_l
+    scavenged_l_num_rate = ifelse(mass_l < 1e-9, 0, scavenged_l_biomass_rate / mass_l)
+    
+    prop_biomass_from_w = ifelse(total_biomass_C_available < 1e-9, 0, biomass_C_w_available / total_biomass_C_available)
+    scavenged_w_biomass_rate = total_carcass_biomass_scavenged_by_hyenas_potential * prop_biomass_from_w
+    scavenged_w_num_rate = ifelse(mass_w < 1e-9, 0, scavenged_w_biomass_rate / mass_w)
+  }
+  
+  scavenged_l_num_rate = min(scavenged_l_num_rate, C_l * max_scav_frac_per_day, C_l)
+  scavenged_w_num_rate = min(scavenged_w_num_rate, C_w * max_scav_frac_per_day, C_w)
+
+  flow_to_sporulation_L_flow = gamma_to_spores * C_l
+  flow_to_sporulation_W_flow = gamma_to_spores * C_w
+  
+  decay_C_l_flow = delta_c * C_l
+  decay_C_w_flow = delta_c * C_w
+
+  total_outflow_C_l = flow_to_sporulation_L_flow + decay_C_l_flow + scavenged_l_num_rate
+  if (total_outflow_C_l > C_l && C_l > 1e-9) {
+      scale_factor_Cl = C_l / total_outflow_C_l
+      flow_to_sporulation_L_flow = flow_to_sporulation_L_flow * scale_factor_Cl
+      decay_C_l_flow = decay_C_l_flow * scale_factor_Cl
+      scavenged_l_num_rate = scavenged_l_num_rate * scale_factor_Cl
+  }
+  
+  total_outflow_C_w = flow_to_sporulation_W_flow + decay_C_w_flow + scavenged_w_num_rate
+   if (total_outflow_C_w > C_w && C_w > 1e-9) {
+      scale_factor_Cw = C_w / total_outflow_C_w
+      flow_to_sporulation_W_flow = flow_to_sporulation_W_flow * scale_factor_Cw
+      decay_C_w_flow = decay_C_w_flow * scale_factor_Cw
+      scavenged_w_num_rate = scavenged_w_num_rate * scale_factor_Cw
+  }
+
+  dC_l_dt = death_l_disease_flow - flow_to_sporulation_L_flow - decay_C_l_flow - scavenged_l_num_rate
+  dC_w_dt = death_w_disease_flow - flow_to_sporulation_W_flow - decay_C_w_flow - scavenged_w_num_rate
+
+  # --- Carcass Delay for Sporulation ---
+  dDeadL_Day1_for_spores_dt = flow_to_sporulation_L_flow - k_delay_spore * DeadL_Day1_for_spores
+  dDeadL_Day2_for_spores_dt = k_delay_spore * DeadL_Day1_for_spores - k_delay_spore * DeadL_Day2_for_spores
+  
+  dDeadW_Day1_for_spores_dt = flow_to_sporulation_W_flow - k_delay_spore * DeadW_Day1_for_spores # Uses DeadW_Day1_for_spores
+  dDeadW_Day2_for_spores_dt = k_delay_spore * DeadW_Day1_for_spores - k_delay_spore * DeadW_Day2_for_spores # Uses DeadW_Day1_for_spores and DeadW_Day2_for_spores
+
+  # --- Spore Dynamics --- 
+  spore_input_rate_from_L_carcasses = theta_spores * (k_delay_spore * DeadL_Day2_for_spores)
+  spore_input_rate_from_W_carcasses = theta_spores * (k_delay_spore * DeadW_Day2_for_spores) # Uses DeadW_Day2_for_spores
+  
+  dB_dt = (spore_input_rate_from_L_carcasses + spore_input_rate_from_W_carcasses) - delta_B * B
+
+  # Return derivatives in this exact order of initial_state_values
+  return(list(c(dS_h_dt, dI_h_dt, dR_h_dt, dD_h_disease_cumulative_dt, dCum_I_h_dt, 
+                dS_l_dt, dI_l_dt, dC_l_dt, dD_l_disease_cumulative_L_dt, dCum_I_l_dt_livestock, 
+                dDeadL_Day1_for_spores_dt, dDeadL_Day2_for_spores_dt,
+                dS_w_dt, dI_w_dt, dC_w_dt, dD_w_disease_cumulative_W_dt, dCum_I_w_dt_wildlife, 
+                dDeadW_Day1_for_spores_dt, dDeadW_Day2_for_spores_dt, # These derivatives use the unpacked states
+                dB_dt)))
+}
+```
+#--- Define All Parameters, Initial Conditions, and Run Simulation ---
+```{r}
+# =============================================================================
+# PART 1: DEFINE MODEL PARAMETERS
+# =============================================================================
+# ---------------------------------------------------------
+# 2) Define Model Parameters to Match Targets from Literature
+# ---------------------------------------------------------
+# --- Pre-calculate values for the list ---
+
+# -- Humans --
+val_cfr_h <- 0.149                                  # Case‐fatality rate (14.9%) - Kisaakye et al. 2020; Tumusiime et al. 2025
+val_duration_infection_h <- 14                      # Infection duration (days) - Kisaakye et al. 2020; Tumusiime et al. 2025
+val_sigma_h <- 1 / val_duration_infection_h         # Recovery+death rate (day⁻¹)
+
+# -- Livestock --
+val_cfr_l <- 0.95                                   # Livestock case-fatality rate (95%) - Merck Vet Manual
+val_duration_infection_l <- 2.5                     # Livestock average infection duration (days) - Merck Vet Manual (48-72 hrs)
+val_sigma_l <- 1 / val_duration_infection_l         # Livestock total rate of leaving I_l (day⁻¹)
+val_mu_l_disease <- val_cfr_l * (1 / val_duration_infection_l) # Livestock death rate from disease (day⁻¹)
+val_gamma_l <- (1 - val_cfr_l) * (1 / val_duration_infection_l) # Livestock recovery rate (day⁻¹)
+val_duration_illness_l <- 1 / val_mu_l_disease      # Effective time to death for fatal cases (days) = 1/mu_l_disease. Approx 2.63 days.
+
+# -- Wildlife --
+val_cfr_w <- 0.10                                   # Wildlife case-fatality rate (10%) - Muturi, et al: DOI 10.4269/ajtmh.18-0224
+val_duration_infection_w <- 180                     # Wildlife average infection duration (days) - Based on 10% mortality in 180 days
+val_sigma_w <- 1 / val_duration_infection_w         # Wildlife total rate of leaving I_w (day⁻¹)
+val_mu_w_disease <- val_cfr_w * (1 / val_duration_infection_w) # Wildlife death rate from disease (day⁻¹)
+val_gamma_w <- (1 - val_cfr_w) * (1 / val_duration_infection_w) # Wildlife recovery rate (day⁻¹)
+val_duration_illness_w <- 1 / val_mu_w_disease      # Effective time to death for fatal cases (days) = 1/mu_w_disease. 180 days.
+
+# -- Environmental Reservoir --
+val_theta_spores <- 1e3                            # Spores per carcass - (Literature/Assumption was 1e10, reduced this to 1e3 to make model less sensitive as the model had a rapid die off of all livestock when this was set to 1e10)
+val_carcass_sporulation_delay <- 2                  # Sporulation latency (days) - (Literature/Assumption)
+val_num_delay_stages_spore <- 2                     # Number of delay compartments for sporulation
+val_k_delay_spore <- val_num_delay_stages_spore / val_carcass_sporulation_delay # Transition rate (day⁻¹)
+val_delta_B <- 0.005                                # Spore decay (day⁻¹) - (Literature/Assumption, e.g., ~200 day half-life)
+
+# -- Carcass decay/removal --
+val_delta_c <- 1/10                                 # Carcass natural decay rate (day⁻¹; 10‐day mean) - (Literature/Assumption)
+val_max_scav_frac_per_day <- 1.0                    # Max fraction of a carcass type scavenged per day by all hyenas
+val_gamma_to_spores <- 1.0                          # Rate C_l/C_w move to sporulation delay line (1/day) - (Assumption, fast transition)
+
+# -- Hyena filter parameters --
+val_w_carcass_hyena_daily_kg <- 2.61                # kg carcass/day/hyena (Sonawane et al. 2021)
+val_mass_l <- 350                                   # Livestock carcass mass (kg) - (Assumption/Estimate)
+val_mass_w <- 350                                   # Wildlife carcass mass (kg) - (Assumption/Estimate)
+val_pred_rate_preferred <- 0.05                     # Preferred prey predation (day⁻¹) - (Assumption/Calibration Target Base)
+val_pred_rate_general <- 0.025                      # Non‐preferred scavenging (day⁻¹) - (Assumption/Calibration Target Base)
+
+
+# --- Now, create the params_const list using these pre-calculated values ---
+params_const <- list(
+  # — Humans —
+  cfr_h                   = val_cfr_h,    # Case‐fatality rate (14.9%)
+  duration_infection_h    = val_duration_infection_h,       # Infection duration (days)
+  sigma_h                 = val_sigma_h,     # Recovery+death rate (day⁻¹)
+
+  # — Transmission to calibrate —
+  beta_hl                 = NA,       # livestock→human transmission coef
+
+  # — Environmental exposure to calibrate —
+  psi_l                   = NA,       # livestock soil ingestion (cm³/day)
+  psi_w                   = NA,       # wildlife soil ingestion (cm³/day)
+
+  # — Dose–response parameters —
+  LD50_env                = 1e4,      # LD₅₀ in soil (spores/cm³) - Chosen value, literature LD50 can be higher (e.g., 1e7)
+  n_hill                  = 1,        # Hill exponent
+
+  # — Disease course in animals —
+  # -- Livestock --
+  cfr_l                   = val_cfr_l,    # Livestock case-fatality rate (95%) From Merck Vet Manual 
+  duration_infection_l    = val_duration_infection_l, # Livestock average infection duration (days)
+  sigma_l                 = val_sigma_l,  # Livestock total rate of leaving I_l (day⁻¹)
+  mu_l_disease            = val_mu_l_disease, # Livestock death rate from disease (day⁻¹)
+  gamma_l                 = val_gamma_l,  # Livestock recovery rate (day⁻¹)
+  duration_illness_l      = val_duration_illness_l, # Effective time to death for fatal cases (days)
+
+  # -- Wildlife --
+  cfr_w                   = val_cfr_w,    # Wildlife case-fatality rate (10%), from Muturi et al.
+  duration_infection_w    = val_duration_infection_w, # Wildlife average infection duration (days)
+  sigma_w                 = val_sigma_w,  # Wildlife total rate of leaving I_w (day⁻¹)
+  mu_w_disease            = val_mu_w_disease, # Wildlife death rate from disease (day⁻¹)
+  gamma_w                 = val_gamma_w,  # Wildlife recovery rate (day⁻¹)
+  duration_illness_w      = val_duration_illness_w, # Effective time to death for fatal cases (days)
+  
+  # — Environmental reservoir —
+  theta_spores            = val_theta_spores,     # Spores per carcass
+  carcass_sporulation_delay = val_carcass_sporulation_delay, # Sporulation latency (days)
+  num_delay_stages_spore  = val_num_delay_stages_spore, # Number of delay compartments
+  k_delay_spore           = val_k_delay_spore,    # Transition rate between sporulation delay stages (day⁻¹)
+  delta_B                 = val_delta_B,          # Spore decay (day⁻¹)
+
+  # — Carcass decay/removal —
+  delta_c                 = val_delta_c,          # Carcass natural decay rate (day⁻¹)
+  max_scav_frac_per_day   = val_max_scav_frac_per_day, # Max fraction scavenged/day
+  gamma_to_spores         = val_gamma_to_spores,  # Rate C_l/C_w move to sporulation delay
+
+  # — Hyena filter parameters —
+  N_y                     = NA,       # Number of hyenas (scenario-defined or calibrated)
+  k_pred_l_per_hyena      = NA,       # Predation rate of infected LIVEstock per hyena (scenario-defined)
+  k_pred_w_per_hyena      = NA,       # Predation rate of infected WILDLIFE per hyena (scenario-defined)
+  w_carcass_hyena_daily_kg = val_w_carcass_hyena_daily_kg, # kg carcass/day/hyena
+  mass_l                  = val_mass_l,           # Livestock carcass mass (kg)
+  mass_w                  = val_mass_w,           # Wildlife carcass mass (kg)
+  pred_rate_preferred     = val_pred_rate_preferred, # Preferred prey predation (day⁻¹)
+  pred_rate_general       = val_pred_rate_general  # Non‐preferred scavenging (day⁻¹)
+)
+```
+
+```{r}
+# =============================================================================
+# PART 2: DEFINE INITIAL CONDITIONS
+# =============================================================================
+# Total human population
+total_human_pop <- 21575
+
+# Total livestock population and vaccination adjustment
+total_livestock_pop_given   <- 150000    # Total livestock (head)
+total_livestock_pop  <- 150000 
+vaccination_prop_livestock  <- 0.20      # Proportion of livestock vaccinated at time 0 of the outbreak
+initial_susceptible_livestock <- total_livestock_pop_given * (1 - vaccination_prop_livestock)
+                                  # Unvaccinated livestock entering the S_l compartment
+
+#Total wildlife pop
+total_wildlife_pop  <- 10915
+
+# Pack all state variables into a named vector
+initial_state_values <- c(
+  # Humans (SIR)
+  S_h                    = 21570,       # Susceptible humans
+  I_h                    = 5,           # Initially infected humans, we start the sim with 5 infected humans
+  R_h                    = 0,           # Initially recovered humans
+  D_h_disease_cumulative = 0,           # Cumulative human deaths
+  Cum_I_h                = 5,           # Cumulative human infections
+
+  # Livestock (SI → carcasses)
+  S_l                    = initial_susceptible_livestock,  # Susceptible (unvaccinated) livestock
+  I_l                    = 1,            # Initially infected livestock, we start the sim with 10 infected livestock
+  C_l                    = 0,            # Live carcass count (feed into spores)
+  D_l_disease_cumulative = 0,            # Cumulative livestock deaths
+  Cum_I_l                = 1,            # Cumulative livestock infections
+
+  # Livestock carcass delay stages for sporulation
+  DeadL_Day1_for_spores  = 1,            # Carcasses in delay stage 1, we start the sim with 1 livestock carcass in delay stage 1
+  DeadL_Day2_for_spores  = 1,            # Carcasses in delay stage 2, we start the sim with 1 livestock carcass in delay stage 2
+
+  # Wild herbivores (SI → carcasses)
+  S_w                    = 10914,        # Susceptible wild herbivores
+  I_w                    = 1,            # Initially infected wild herbivores, we start the sim with 15 infected wild herbivores
+  C_w                    = 0,            # Wild herbivore carcass count
+  D_w_disease_cumulative = 0,            # Cumulative wild herbivore deaths
+  Cum_I_w                = 1,            # Cumulative wild herbivore infections
+
+  # Wild carcass delay stages for sporulation
+  DeadW_Day1_for_spores  = 1,            # Carcasses in delay stage 1, we start the sim with 1 wildlife carcass in delay stage 1
+  DeadW_Day2_for_spores  = 1,            # Carcasses in delay stage 2, we start the sim with 1 wildlife carcass in delay stage 1
+
+  # Environmental spores
+  B                      = 10^3            # Initial spore load in environment (spores/cm³), i.e. 1,000 spores/cm³, this was set at this level to calibrate the model in order to keep attack rates for humans, livestock, and wildlife as close to values from the literature. Keep in mind, LD50 is 10^7 (spores/cm³)
+)
+```
+
+```{r}
+# =============================================================================
+# PART 3: DEFINE ATTACK RATES AND CONCEPTUAL HAZARDS
+# =============================================================================
+# This chunk defines the target attack rates from literature and calculates
+# intermediate values (like rho) needed for other conceptual chunks.
+# This is the single source of truth for attack rates.
+
+# --- 1. Define Target Attack Rates (for calibration) ---
+# These are the final cumulative attack rates from literature that the model will be calibrated to.
+target_AR_h <- 4.03  # Human attack rate: 4.03 per 1,000 people
+target_AR_l <- 0.46  # Livestock attack rate: 0.46 per 1,000 cattle
+target_AR_w <- 5.77  # Wildlife attack rate: 5.77 per 1,000 (This is an observed outcome, not a calibration target)
+
+# --- 2. Calculate rho (ρ), the attack fraction per individual ---
+# This is needed for the conceptual hazard calculation in the next chunk.
+# rho = (Attack Rate per 1000) / 1000
+rho_h <- target_AR_h / 1000
+rho_l <- target_AR_l / 1000
+rho_w <- target_AR_w / 1000
+
+# --- 3. Conceptual Hazard Calculation ---
+# ---------------------------------------------------------
+# Compute ρ, estimate c_hl from contact types (with source DOIs), 
+#    and then contact × ρ (“hazard”) for each host
+# ---------------------------------------------------------
+
+# --- 1) Attack‐fraction ρ from outbreak data (cases / population) ---
+# (This is now computed in the chunk above as rho_h, rho_l, rho_w)
+
+# --- 2) Estimate human←livestock contact rate c_hl from three activities ---
+#   • Daily milking/herding touches: 20–30/day 
+#     (estimated from DOI:10.33552/AAHDS.2019.01.000522)
+#   • Slaughter events: ≈0.5/day; Raw‐meat handling: ≈0.5/day 
+#     (combined means from DOI:10.21203/rs.3.rs-5842512/v1)
+touches_mean    <- (20 + 30) / 2    # = 25
+butchering_mean <- 0.5             # mean slaughter events/day
+prep_mean       <- 0.5             # mean raw‐meat handling events/day
+c_hl <- touches_mean + butchering_mean + prep_mean
+#      ≈ 25 + 0.5 + 0.5 = 26.0 contacts per person per day
+
+# --- 3) Define environmental contact = soil ingestion rate (Turner et al. 2013) ---
+soil_ingest_rate <- 1.5            # cm³ soil ingested per animal per day
+c_env_l          <- soil_ingest_rate
+c_env_w          <- soil_ingest_rate
+
+# --- 4) Compute daily hazard = c × ρ for each host ---
+# This chunk will now run correctly because rho_h, rho_l, and rho_w are defined.
+hazard_human     <- c_hl    * rho_h   # human risk from livestock
+hazard_livestock <- c_env_l * rho_l   # livestock risk from environment
+hazard_wild      <- c_env_w * rho_w   # wildlife risk from environment
+
+# --- 5) Store back into parameters list for use in the ODE ---
+# Note: These are conceptual and not directly used by the calibrated ODE model,
+# but we store them for completeness.
+params_const$c_hl    <- c_hl
+params_const$c_env_l <- c_env_l
+params_const$c_env_w <- c_env_w
+
+# --- 6) Print for verification ---
+cat("Daily hazards (c × ρ):\n")
+cat(sprintf(
+  "  humans   = %.4g/day\n  livestock= %.4g/day\n  wildlife = %.4g/day\n",
+  hazard_human, hazard_livestock, hazard_wild
+))
+
+```
+
+```{r}
+
+# =============================================================================
+# PART 4: DEFINE SCENARIOS
+# =============================================================================
+# --- Simulation Time---
+times <- seq(from = 0, to = 180, by = 1)
+scenarios <- list(
+  `Scen 1: Predator Absence` = list(N_y = 0,   k_l_target = "none", k_w_target = "none"),
+  `Scen 2: Carcass Focus (Small Clan N=20)` = list(N_y = 20,  k_l_target = "none", k_w_target = "none"),
+  `Scen 3: Carcass Focus (Large Clan N=150)` = list(N_y = 150, k_l_target = "none", k_w_target = "none"),
+  `Scen 4: Wild Herb Pref (Large Clan N=150)` = list(N_y = 150, k_l_target = "none", k_w_target = "preferred"),
+  `Scen 5: Livestock Pref (Large Clan N=150)` = list(N_y = 150, k_l_target = "preferred", k_w_target = "none"),
+  `Scen 6: Wild Herb Pref (Small Clan N=20)` = list(N_y = 20,  k_l_target = "none", k_w_target = "preferred"),
+  `Scen 7: Livestock Pref (Small Clan N=20)` = list(N_y = 20,  k_l_target = "preferred", k_w_target = "none"),
+  `Scen 8: No Prey Pref (Large Clan N=150)` = list(N_y = 150, k_l_target = "general", k_w_target = "general"),
+  `Scen 9: No Prey Pref (Small Clan N=20)` = list(N_y = 20,  k_l_target = "general", k_w_target = "general"))
+get_pred_rate <- function(target_str, p_const_obj) {
+  if (target_str == "none") return(0); if (target_str == "preferred") return(p_const_obj$pred_rate_preferred)
+  if (target_str == "general") return(p_const_obj$pred_rate_general); stop("Error: Unknown predation target string.")}
+
+```
+
+```{r}
+# =============================================================================
+# PART 5: CALIBRATE AND RUN ALL SCENARIOS
+# =============================================================================
+# --- Calibrate Transmission Parameters (Where psi_l = psi_w) & Run All Scenarios ---
+
+cat("\n\n--- Calibrating Transmission Parameters (Assuming psi_l = psi_w) ---\n")
+
+# Modify params_const for calibration setup
+params_for_calibration <- params_const 
+params_for_calibration$psi_common <- NA 
+params_for_calibration$psi_l <- NULL    
+params_for_calibration$psi_w <- NULL    
+if (is.null(params_for_calibration$gamma_to_spores)) { 
+    params_for_calibration$gamma_to_spores <- 1.0 
+}
+
+# --- Objective Function for Calibration ---
+objective_function_AR_psi_common <- function(param_value, param_name_to_set, 
+                                             target_AR_val, initial_state_calib, 
+                                             times_calib, params_template_calib, 
+                                             population_for_AR_calc, cumulative_infections_col_name) {
+  params_run <- params_template_calib
+  if (param_name_to_set == "psi_common") {
+    params_run[["psi_l"]] <- param_value 
+    params_run[["psi_w"]] <- param_value
+    params_run[["psi_common"]] <- param_value 
+  } else {
+    params_run[[param_name_to_set]] <- param_value 
+  }
+  
+  baseline_scen_config <- scenarios$`Scen 1: Predator Absence`
+  params_run$N_y <- baseline_scen_config$N_y
+  params_run$k_pred_l_per_hyena <- get_pred_rate(baseline_scen_config$k_l_target, params_const) 
+  params_run$k_pred_w_per_hyena <- get_pred_rate(baseline_scen_config$k_w_target, params_const)
+
+  critical_params_for_ode <- c("beta_hl", "psi_l", "psi_w", "N_y", "k_pred_l_per_hyena", "k_pred_w_per_hyena", "gamma_to_spores") 
+  if (any(sapply(params_run[critical_params_for_ode], is.null)) || any(is.na(unlist(params_run[critical_params_for_ode])))) {
+    return(1e9)
+  }
+
+  sim_output_calib <- tryCatch({
+    suppressWarnings(
+      ode(y = initial_state_calib, times = times_calib, func = anthrax_model_ode, 
+          parms = params_run, method="lsoda", maxsteps=200000) 
+    )
+  }, error = function(e) { NULL })
+  
+  if (is.null(sim_output_calib) || any(is.na(sim_output_calib))) {
+    return(1e9) 
+  }
+  
+  final_day_calib <- tail(as.data.frame(sim_output_calib), 1)
+  if (!cumulative_infections_col_name %in% names(final_day_calib)) return(1e9)
+  if (population_for_AR_calc <= 0) return(1e9)
+  sim_AR_calib <- (final_day_calib[[cumulative_infections_col_name]] / population_for_AR_calc) * 1000
+  return(sim_AR_calib - target_AR_val)
+}
+
+```
+
+```{r}
+# --- Calibration Order: 1. psi_common, then 2. beta_hl ---
+
+# --- A. Calibrate psi_common FIRST ---
+cat("\n--- A. Calibrating psi_common (with placeholder beta_hl) ---\n")
+params_for_psi_calib_pass1 <- params_for_calibration 
+params_for_psi_calib_pass1$beta_hl <- 1.5e-08 # Placeholder beta_hl for this step (value from previous successful beta_hl calib)
+
+psi_common_lower_bound <- 1e-7   
+psi_common_upper_bound <- 0.1    
+
+val_at_lower_psi_common <- objective_function_AR_psi_common(psi_common_lower_bound, "psi_common", target_AR_l, initial_state_values, times, params_for_psi_calib_pass1, total_livestock_pop, "Cum_I_l") 
+val_at_upper_psi_common <- objective_function_AR_psi_common(psi_common_upper_bound, "psi_common", target_AR_l, initial_state_values, times, params_for_psi_calib_pass1, total_livestock_pop, "Cum_I_l") 
+cat(sprintf("Target Livestock AR: %.4f\n", target_AR_l))
+cat(sprintf("Objective function for psi_common at initial lower bound (%g): %f (Simulated AR would be %.4f)\n", psi_common_lower_bound, val_at_lower_psi_common, val_at_lower_psi_common + target_AR_l))
+cat(sprintf("Objective function for psi_common at initial upper bound (%g): %f (Simulated AR would be %.4f)\n", psi_common_upper_bound, val_at_upper_psi_common, val_at_upper_psi_common + target_AR_l))
+
+psi_common_calibrated_val <- 0.001 
+
+iter_count_psi <- 0
+max_iter_bounds_psi <- 20 # Increased max iterations
+while ((is.na(val_at_lower_psi_common) || is.na(val_at_upper_psi_common) || is.infinite(val_at_lower_psi_common) || is.infinite(val_at_upper_psi_common) || (val_at_lower_psi_common * val_at_upper_psi_common >= 0)) && iter_count_psi < max_iter_bounds_psi) {
+  iter_count_psi <- iter_count_psi + 1
+  if (val_at_lower_psi_common > 0) { 
+    psi_common_upper_bound <- psi_common_lower_bound
+    psi_common_lower_bound <- psi_common_lower_bound / 10
+  } else if (val_at_upper_psi_common < 0) { 
+    psi_common_lower_bound <- psi_common_upper_bound 
+    psi_common_upper_bound <- psi_common_upper_bound * 5
+     if (psi_common_upper_bound == 0 && psi_common_lower_bound == 0) psi_common_upper_bound <- 1e-5 # Kickstart if stuck at zero
+  } else { 
+     if(val_at_lower_psi_common >=0 && val_at_upper_psi_common >=0){ # Both positive
+        psi_common_upper_bound <- (psi_common_lower_bound + psi_common_upper_bound) / 2 # Midpoint
+        if(psi_common_upper_bound <= psi_common_lower_bound) psi_common_lower_bound <- psi_common_lower_bound / 2
+     } else { # Both negative
+        psi_common_upper_bound <- psi_common_upper_bound * 2 
+     }
+  }
+   if (psi_common_upper_bound <= psi_common_lower_bound || psi_common_upper_bound > 100 || psi_common_lower_bound < 1e-12) { 
+      break
+  }
+  val_at_lower_psi_common <- objective_function_AR_psi_common(psi_common_lower_bound, "psi_common", target_AR_l, initial_state_values, times, params_for_psi_calib_pass1, total_livestock_pop, "Cum_I_l") 
+  val_at_upper_psi_common <- objective_function_AR_psi_common(psi_common_upper_bound, "psi_common", target_AR_l, initial_state_values, times, params_for_psi_calib_pass1, total_livestock_pop, "Cum_I_l") 
+}
+
+if (is.na(val_at_lower_psi_common) || is.na(val_at_upper_psi_common) || is.infinite(val_at_lower_psi_common) || is.infinite(val_at_upper_psi_common) || (val_at_lower_psi_common * val_at_upper_psi_common >= 0)) {
+  cat("Calibration bounds issue for psi_common persists after attempts. Using placeholder.\n")
+} else {
+  calibration_result_psi_common <- tryCatch(uniroot(objective_function_AR_psi_common, interval = c(psi_common_lower_bound, psi_common_upper_bound),
+            param_name_to_set = "psi_common", target_AR_val = target_AR_l, initial_state_calib = initial_state_values, 
+            times_calib = times, params_template_calib = params_for_psi_calib_pass1, 
+            population_for_AR_calc = total_livestock_pop, cumulative_infections_col_name = "Cum_I_l", tol = 1e-6),
+            error = function(e) {message("uniroot error for psi_common: ", e$message); NULL})
+  if (!is.null(calibration_result_psi_common) && !is.null(calibration_result_psi_common$root)) {
+      psi_common_calibrated_val <- calibration_result_psi_common$root
+      cat(sprintf("Successfully calibrated psi_common (Pass 1): %g\n", psi_common_calibrated_val))
+  } else {
+      cat("uniroot for psi_common failed despite bounds. Using placeholder.\n")
+  }
+}
+params_for_calibration$psi_l <- psi_common_calibrated_val
+params_for_calibration$psi_w <- psi_common_calibrated_val
+params_for_calibration$psi_common <- psi_common_calibrated_val
+
+# --- B. Calibrate beta_hl SECOND (using calibrated psi_common) ---
+cat("\n--- B. Calibrating beta_hl (using now-set psi_common) ---\n")
+params_for_beta_hl_calib <- params_for_calibration 
+
+cat("Target Human AR: %.4f\n", target_AR_h)
+beta_hl_lower_bound <- 1e-09 
+beta_hl_upper_bound <- 1e-04 
+
+val_at_lower_beta_hl <- objective_function_AR_psi_common(beta_hl_lower_bound, "beta_hl", target_AR_h, initial_state_values, times, params_for_beta_hl_calib, total_human_pop, "Cum_I_h") 
+val_at_upper_beta_hl <- objective_function_AR_psi_common(beta_hl_upper_bound, "beta_hl", target_AR_h, initial_state_values, times, params_for_beta_hl_calib, total_human_pop, "Cum_I_h") 
+cat(sprintf("Objective function for beta_hl at initial lower bound (%g): %f (Simulated AR would be %.4f)\n", beta_hl_lower_bound, val_at_lower_beta_hl, val_at_lower_beta_hl + target_AR_h))
+cat(sprintf("Objective function for beta_hl at initial upper bound (%g): %f (Simulated AR would be %.4f)\n", beta_hl_upper_bound, val_at_upper_beta_hl, val_at_upper_beta_hl + target_AR_h))
+
+beta_hl_calibrated_val <- 1e-7 
+
+iter_count_beta <- 0 
+max_iter_bounds_beta <- 20
+while ((is.na(val_at_lower_beta_hl) || is.na(val_at_upper_beta_hl) || is.infinite(val_at_lower_beta_hl) || is.infinite(val_at_upper_beta_hl) || (val_at_lower_beta_hl * val_at_upper_beta_hl >= 0)) && iter_count_beta < max_iter_bounds_beta) {
+  iter_count_beta <- iter_count_beta + 1
+  if (val_at_lower_beta_hl > 0) { 
+    beta_hl_upper_bound <- beta_hl_lower_bound 
+    beta_hl_lower_bound <- beta_hl_lower_bound / 10
+  } else if (val_at_upper_beta_hl < 0) { 
+    beta_hl_lower_bound <- beta_hl_upper_bound 
+    beta_hl_upper_bound <- beta_hl_upper_bound * 10 
+     if (beta_hl_upper_bound == 0 && beta_hl_lower_bound == 0) beta_hl_upper_bound <- 1e-5 
+  } else { 
+     if(val_at_lower_beta_hl >=0 && val_at_upper_beta_hl >=0){
+        beta_hl_upper_bound <- (beta_hl_lower_bound + beta_hl_upper_bound) / 2
+        if(beta_hl_upper_bound <= beta_hl_lower_bound) beta_hl_lower_bound <- beta_hl_lower_bound / 2
+     } else { 
+        beta_hl_upper_bound <- beta_hl_upper_bound * 2
+     }
+  }
+  if (beta_hl_upper_bound <= beta_hl_lower_bound || beta_hl_upper_bound > 1 || beta_hl_lower_bound < 1e-15) { 
+      break
+  }
+  val_at_lower_beta_hl <- objective_function_AR_psi_common(beta_hl_lower_bound, "beta_hl", target_AR_h, initial_state_values, times, params_for_beta_hl_calib, total_human_pop, "Cum_I_h") 
+  val_at_upper_beta_hl <- objective_function_AR_psi_common(beta_hl_upper_bound, "beta_hl", target_AR_h, initial_state_values, times, params_for_beta_hl_calib, total_human_pop, "Cum_I_h") 
+}
+
+if (is.na(val_at_lower_beta_hl) || is.na(val_at_upper_beta_hl) || is.infinite(val_at_lower_beta_hl) || is.infinite(val_at_upper_beta_hl) || (val_at_lower_beta_hl * val_at_upper_beta_hl >= 0) ) {
+  cat("Calibration bounds issue for beta_hl persists after attempts. Using placeholder.\n")
+} else {
+  calibration_result_beta_hl <- tryCatch(uniroot(objective_function_AR_psi_common, interval = c(beta_hl_lower_bound, beta_hl_upper_bound),
+            param_name_to_set = "beta_hl", target_AR_val = target_AR_h, initial_state_calib = initial_state_values, 
+            times_calib = times, params_template_calib = params_for_beta_hl_calib, 
+            population_for_AR_calc = total_human_pop, cumulative_infections_col_name = "Cum_I_h", tol = 1e-7), 
+            error = function(e) {message("uniroot error for beta_hl: ", e$message); NULL})
+  if (!is.null(calibration_result_beta_hl) && !is.null(calibration_result_beta_hl$root)) {
+      beta_hl_calibrated_val <- calibration_result_beta_hl$root
+      cat(sprintf("Successfully calibrated beta_hl: %g\n", beta_hl_calibrated_val))
+  } else {
+      cat("uniroot for beta_hl failed despite suitable bounds. Using placeholder.\n")
+  }
+}
+params_for_calibration$beta_hl <- beta_hl_calibrated_val 
+
+params_final_calibrated <- params_for_calibration
+cat("\n--- Final Calibrated Parameters for Scenario Runs: ---\n")
+cat(sprintf("beta_hl: %g, psi_common: %g, gamma_to_spores: %g\n", 
+            params_final_calibrated$beta_hl, params_final_calibrated$psi_common, params_final_calibrated$gamma_to_spores))
+```
+
+```{r}
+# --- Run Simulation for Each Scenario ---
+cat("\n\n--- Running Simulations for All Scenarios ---\n")
+results_all_scenarios <- list()
+
+# FIX 1: Define the list of parameters the ODE function explicitly uses for validation.
+# This variable was missing, causing an "object not found" error.
+explicit_params_list_for_ode <- c(
+  "beta_hl", "sigma_h", "cfr_h", "psi_l", "psi_w", "LD50_env", "n_hill", 
+  "mu_l_disease", "gamma_l", "mu_w_disease", "gamma_w", "theta_spores", 
+  "delta_B", "k_delay_spore", "delta_c", "N_y", "k_pred_l_per_hyena", 
+  "k_pred_w_per_hyena", "w_carcass_hyena_daily_kg", "mass_l", "mass_w", 
+  "max_scav_frac_per_day", "gamma_to_spores"
+)
+
+scen_names_to_run <- names(scenarios)
+
+for (scen_name in scen_names_to_run) {
+  cat("\n-------------------------------------------------------\n")
+  cat("DEBUG: Preparing to run Scenario:", scen_name, "\n")
+  current_scen_config <- scenarios[[scen_name]]
+  
+  params_scenario <- params_final_calibrated
+  
+  params_scenario$N_y <- current_scen_config$N_y
+  k_l_val <- get_pred_rate(current_scen_config$k_l_target, params_const)
+  k_w_val <- get_pred_rate(current_scen_config$k_w_target, params_const)
+  params_scenario$k_pred_l_per_hyena <- k_l_val
+  params_scenario$k_pred_w_per_hyena <- k_w_val
+  
+  if (!is.null(params_scenario$psi_common) && is.numeric(params_scenario$psi_common)) {
+    params_scenario$psi_l <- params_scenario$psi_common
+    params_scenario$psi_w <- params_scenario$psi_common
+  } else {
+    params_scenario$psi_l <- if (is.null(params_scenario$psi_l) || is.na(params_scenario$psi_l)) 0.01 else params_scenario$psi_l
+    params_scenario$psi_w <- if (is.null(params_scenario$psi_w) || is.na(params_scenario$psi_w)) 0.01 else params_scenario$psi_w
+  }
+  
+  na_params_in_scenario <- c()
+  for (p_name in explicit_params_list_for_ode) {
+    if (!p_name %in% names(params_scenario)) {
+      na_params_in_scenario <- c(na_params_in_scenario, paste0(p_name, " (MISSING)"))
+    } else {
+      val <- params_scenario[[p_name]]
+      if (is.null(val) || is.na(val) || is.infinite(val) || is.nan(val)) {
+        na_params_in_scenario <- c(na_params_in_scenario, paste0(p_name, " (INVALID: ", val, ")"))
+      }
+    }
+  }
+  
+  if (length(na_params_in_scenario) > 0) {
+    message(sprintf("WARNING: Scenario '%s' has missing or invalid parameters:\n%s",
+                    scen_name, paste(na_params_in_scenario, collapse = ", ")))
+    sim_output <- NULL
+  } else {
+    sim_output <- tryCatch({
+      ode(y = initial_state_values, times = times, func = anthrax_model_ode,
+          parms = params_scenario, method = "lsoda", maxsteps = 500000)
+    }, error = function(e) {
+      message(sprintf("  ODE solver error for scenario '%s': %s", scen_name, e$message))
+      return(NULL)
+    })
+  }
+  # DEBUG: Removed the stray `return(NULL)` and extra `}` that were here, which caused a syntax error.
+  
+  if (is.null(sim_output) || any(is.na(sim_output))) {
+    col_names_output <- c("time", names(initial_state_values))
+    dummy_df <- as.data.frame(matrix(NA, nrow = length(times), ncol = length(col_names_output)))
+    colnames(dummy_df) <- col_names_output
+    dummy_df$time <- times
+    results_all_scenarios[[scen_name]] <- dummy_df
+  } else {
+    results_all_scenarios[[scen_name]] <- as.data.frame(sim_output)
+  }
+}
+cat("All scenario simulations complete.\n")
+
+# --- Output Calculated Attack Rates from Simulations ---
+cat("\n--- Calculated Attack Rates (per 1,000 population) at Day", max(times), " ---\n")
+attack_rates_summary <- data.frame(Scenario=character(), N_y=numeric(), Human_AR=numeric(), Livestock_AR=numeric(), WildHerb_AR=numeric(), Final_B=numeric(), stringsAsFactors=FALSE)
+for (scen_name in names(results_all_scenarios)) {
+  final_day_data <- tail(results_all_scenarios[[scen_name]], 1)
+  AR_h_sim <- if(nrow(final_day_data)==0 || !("Cum_I_h" %in% names(final_day_data)) || all(is.na(final_day_data$Cum_I_h))) NA else (final_day_data$Cum_I_h / total_human_pop) * 1000
+  AR_l_sim <- if(nrow(final_day_data)==0 || !("Cum_I_l" %in% names(final_day_data)) || all(is.na(final_day_data$Cum_I_l))) NA else (final_day_data$Cum_I_l / total_livestock_pop) * 1000
+  AR_w_sim <- if(nrow(final_day_data)==0 || !("Cum_I_w" %in% names(final_day_data)) || all(is.na(final_day_data$Cum_I_w))) NA else (final_day_data$Cum_I_w / total_wildlife_pop) * 1000
+  final_B_val <- if(nrow(final_day_data)==0 || !("B" %in% names(final_day_data)) || all(is.na(final_day_data$B))) NA else final_day_data$B
+  current_N_y <- scenarios[[scen_name]]$N_y
+  cat(sprintf("Scen: %s (N_y=%d) H_AR:%.2f L_AR:%.2f W_AR:%.2f B:%.1e\n", scen_name, current_N_y, AR_h_sim, AR_l_sim, AR_w_sim, final_B_val))
+  attack_rates_summary <- rbind(attack_rates_summary, data.frame(Scenario=scen_name, N_y=current_N_y, Human_AR=AR_h_sim, Livestock_AR=AR_l_sim, WildHerb_AR=AR_w_sim, Final_B=final_B_val))
+}
+cat("\nSummary of simulated Attack Rates stored in 'attack_rates_summary'.\n")
+
+# --- Generate Plots for Each Scenario (Individual Dynamics) ---
+cat("\n--- Generating Plots for Each Scenario (Displaying in R Environment using ggplot2) ---\n")
+create_placeholder_plot <- function(title_text) {
+  ggplot() + annotate("text", x = 0.5, y = 0.5, label = paste("Data error or NAs for:\n", title_text), size = 5, hjust = 0.5) +
+    labs(title = title_text) + theme_void() 
+}
+
+for (scen_name in names(results_all_scenarios)) {
+  cat("Plotting for:", scen_name, "\n")
+  df_plot_wide <- results_all_scenarios[[scen_name]]
+  
+  if(is.null(df_plot_wide) || !is.data.frame(df_plot_wide) || nrow(df_plot_wide) == 0 || all(sapply(df_plot_wide, function(col) all(is.na(col)))) ) {
+      cat("  Skipping plots for scenario '", scen_name, "' due to missing, empty, or all NA data (likely ODE failure).\n")
+      if (interactive()) {
+        try(print(create_placeholder_plot(paste("All data NA for scenario:", scen_name))), silent=TRUE)
+      }
+      next 
+  }
+
+  plot_list_p1 <- list() 
+  plot_list_p2 <- list() 
+  plot_list_p3 <- list() 
+
+  # Page 1 Plots
+  plot_list_p1$p1a <- tryCatch({ 
+    if (!"S_h" %in% names(df_plot_wide) || all(is.na(df_plot_wide$S_h))) stop("Column S_h missing or all NA")
+    ggplot(df_plot_wide, aes(x = time, y = S_h)) + geom_line(color = "blue") +
+      labs(title = "Susceptible Humans (S_h)", x = "Time (days)", y = "Number") + theme_minimal() + ylim(0, NA)
+  }, error = function(e) { create_placeholder_plot(paste("S_h\nError:", e$message)) })
+  
+  plot_list_p1$p1b <- tryCatch({ 
+    if (!all(c("time", "I_h", "R_h") %in% names(df_plot_wide))) stop("time, I_h or R_h missing")
+    df_human_IR <- df_plot_wide %>% dplyr::select(time, I_h, R_h) %>% tidyr::pivot_longer(cols = -time, names_to = "Compartment", values_to = "Count")
+    if(nrow(df_human_IR) == 0 || all(is.na(df_human_IR$Count))) stop("Empty/NA data Human I_h, R_h")
+    ggplot(df_human_IR, aes(x = time, y = Count, color = Compartment)) + geom_line() +
+      labs(title = "Infected & Recovered Humans", x = "Time (days)", y = "Number") +
+      scale_color_manual(values = c("I_h" = "red", "R_h" = "green")) + theme_minimal() + ylim(0, NA) 
+  }, error = function(e) { create_placeholder_plot(paste("Human I_h, R_h\nError:", e$message)) })
+  
+  plot_list_p1$p2 <- tryCatch({ 
+    if (!all(c("time", "Cum_I_h", "D_h_disease_cumulative") %in% names(df_plot_wide))) stop("time, Cum_I_h or D_h_disease_cumulative missing")
+    df_human_cum <- df_plot_wide %>% dplyr::select(time, Cum_I_h, D_h_disease_cumulative) %>% dplyr::rename(`Cum. Infections` = Cum_I_h, `Cum. Deaths` = D_h_disease_cumulative) %>% tidyr::pivot_longer(cols = -time, names_to = "Metric", values_to = "Count")
+    if(nrow(df_human_cum) == 0 || all(is.na(df_human_cum$Count))) stop("Empty/NA data Human Cum.")
+    ggplot(df_human_cum, aes(x = time, y = Count, color = Metric, linetype = Metric)) + geom_line() +
+      labs(title = "Human Cum. Infections & Deaths", x = "Time (days)", y = "Cumulative Count") +
+      scale_color_manual(values = c("Cum. Infections" = "purple", "Cum. Deaths" = "black")) +
+      scale_linetype_manual(values = c("Cum. Infections" = "solid", "Cum. Deaths" = "dashed")) + theme_minimal() + ylim(0, NA)
+  }, error = function(e) { create_placeholder_plot(paste("Human Cum. Inf/Deaths\nError:", e$message)) })
+  
+  plot_list_p1$p3a <- tryCatch({ 
+    if (!"S_l" %in% names(df_plot_wide) || all(is.na(df_plot_wide$S_l))) stop("Column S_l missing or all NA")
+    ggplot(df_plot_wide, aes(x = time, y = S_l)) + geom_line(color = "blue") +
+      labs(title = "Susceptible Livestock (S_l)", x = "Time (days)", y = "Number") + theme_minimal() + ylim(0, NA)
+  }, error = function(e) { create_placeholder_plot(paste("S_l\nError:", e$message)) })
+
+  try(print(grid.arrange(grobs = plot_list_p1, ncol = 2, top = grid::textGrob(paste("Page 1:", scen_name), gp=grid::gpar(fontsize=14)))), silent = TRUE)
+
+  # Page 2 Plots
+  plot_list_p2$p3b <- tryCatch({ 
+    if (!all(c("time", "I_l") %in% names(df_plot_wide))) stop("time or I_l missing")
+    df_livestock_I <- df_plot_wide %>% dplyr::select(time, I_l) %>% tidyr::pivot_longer(cols = -time, names_to = "Compartment", values_to = "Count") 
+    if(nrow(df_livestock_I) == 0 || all(is.na(df_livestock_I$Count))) stop("Empty/NA data Livestock I_l")
+    ggplot(df_livestock_I, aes(x = time, y = Count, color = Compartment)) + geom_line() + 
+      labs(title = "Infected Livestock (I_l)", x = "Time (days)", y = "Number") +
+      scale_color_manual(values = c("I_l" = "red")) + theme_minimal() + ylim(0, NA)
+  }, error = function(e) { create_placeholder_plot(paste("Livestock I_l\nError:", e$message)) })
+  
+  plot_list_p2$p4 <- tryCatch({ 
+    if (!all(c("time", "C_l", "D_l_disease_cumulative") %in% names(df_plot_wide))) stop("time, C_l or D_l_disease_cumulative missing")
+    df_livestock_carcass <- df_plot_wide %>% dplyr::select(time, C_l, D_l_disease_cumulative) %>% dplyr::rename(`Carcasses (C_l)` = C_l, `Cum. Deaths` = D_l_disease_cumulative) %>% tidyr::pivot_longer(cols = -time, names_to = "Metric", values_to = "Count")
+    if(nrow(df_livestock_carcass) == 0 || all(is.na(df_livestock_carcass$Count))) stop("Empty/NA data Livestock Carcasses")
+    ggplot(df_livestock_carcass, aes(x = time, y = Count, color = Metric, linetype = Metric)) + geom_line() +
+      labs(title = "Livestock Carcasses & Cum. Deaths", x = "Time (days)", y = "Count") +
+      scale_color_manual(values = c("Carcasses (C_l)" = "brown", "Cum. Deaths" = "black")) +
+      scale_linetype_manual(values = c("Carcasses (C_l)" = "solid", "Cum. Deaths" = "dashed")) + theme_minimal() + ylim(0, NA)
+  }, error = function(e) { create_placeholder_plot(paste("Livestock Carcasses\nError:", e$message)) })
+  
+  plot_list_p2$p5a <- tryCatch({ 
+    if (!"S_w" %in% names(df_plot_wide) || all(is.na(df_plot_wide$S_w))) stop("Column S_w missing or all NA")
+    ggplot(df_plot_wide, aes(x = time, y = S_w)) + geom_line(color = "blue") +
+      labs(title = "Susceptible Wildlife (S_w)", x = "Time (days)", y = "Number") + theme_minimal() + ylim(0, NA)
+  }, error = function(e) { create_placeholder_plot(paste("S_w\nError:", e$message)) })
+  
+  plot_list_p2$p5b <- tryCatch({ 
+    if (!all(c("time", "I_w") %in% names(df_plot_wide))) stop("time or I_w missing")
+    df_wild_I <- df_plot_wide %>% dplyr::select(time, I_w) %>% tidyr::pivot_longer(cols = -time, names_to = "Compartment", values_to = "Count") 
+    if(nrow(df_wild_I) == 0 || all(is.na(df_wild_I$Count))) stop("Empty/NA data Wildlife I_w")
+    ggplot(df_wild_I, aes(x = time, y = Count, color = Compartment)) + geom_line() + 
+      labs(title = "Infected Wildlife (I_w)", x = "Time (days)", y = "Number") +
+      scale_color_manual(values = c("I_w" = "red")) + theme_minimal() + ylim(0, NA)
+  }, error = function(e) { create_placeholder_plot(paste("Wildlife I_w\nError:", e$message)) })
+
+  try(print(grid.arrange(grobs = plot_list_p2, ncol = 2, top = grid::textGrob(paste("Page 2:", scen_name), gp=grid::gpar(fontsize=14)))), silent = TRUE)
+
+  # Page 3 Plots
+  plot_list_p3$p6 <- tryCatch({ 
+    if (!all(c("time", "C_w", "D_w_disease_cumulative") %in% names(df_plot_wide))) stop("time, C_w or D_w_disease_cumulative missing")
+    df_wildherb_carcass <- df_plot_wide %>% dplyr::select(time, C_w, D_w_disease_cumulative) %>% 
+                           dplyr::rename(`Carcasses (C_w)` = C_w, `Wildlife Cum. Deaths` = D_w_disease_cumulative) %>% 
+                           tidyr::pivot_longer(cols = -time, names_to = "Metric", values_to = "Count")
+    if(nrow(df_wildherb_carcass) == 0 || all(is.na(df_wildherb_carcass$Count))) stop("Empty/NA data Wild Herb Carcasses")
+    ggplot(df_wildherb_carcass, aes(x = time, y = Count, color = Metric, linetype = Metric)) + geom_line() +
+      labs(title = "Wild Herb. Carcasses & Cum. Deaths", x = "Time (days)", y = "Count") +
+      scale_color_manual(values = c("Carcasses (C_w)" = "orange", "Wildlife Cum. Deaths" = "black")) +
+      scale_linetype_manual(values = c("Carcasses (C_w)" = "solid", "Wildlife Cum. Deaths" = "dashed")) + theme_minimal() + ylim(0, NA)
+  }, error = function(e) { create_placeholder_plot(paste("Wild Herb. Carcasses\nError:", e$message)) })
+  
+  plot_list_p3$p7 <- tryCatch({ 
+    if (!"B" %in% names(df_plot_wide) || all(is.na(df_plot_wide$B))) stop("Column B missing or all NA")
+    ggplot(df_plot_wide, aes(x = time, y = B)) + geom_line(color = "darkgreen") +
+      labs(title = "Environmental Spore Load (B)", x = "Time (days)", y = "Spores/cm³") + theme_minimal() + ylim(0, NA)
+  }, error = function(e) { create_placeholder_plot(paste("Spores (B)\nError:", e$message)) })
+  
+  if(length(plot_list_p3) == 2) {
+      plot_list_p3$p_empty1 <- ggplot() + theme_void()
+      plot_list_p3$p_empty2 <- ggplot() + theme_void()
+  } else if (length(plot_list_p3) == 1) { 
+      plot_list_p3$p_empty1 <- ggplot() + theme_void()
+      plot_list_p3$p_empty2 <- ggplot() + theme_void()
+      plot_list_p3$p_empty3 <- ggplot() + theme_void()
+  }
+
+  try(print(grid.arrange(grobs = plot_list_p3, ncol = 2, top = grid::textGrob(paste("Page 3:", scen_name), gp=grid::gpar(fontsize=14)))), silent = TRUE)
+}
+cat("All scenario plots have been displayed (or attempted).\n")
+```
+#OPTIONAL:Summary table from scenarios
+```{r}
+# --- Generate Summary Table for Specific Time Points ---
+cat("\n--- Generating Summary Table of Infections, Deaths, and Spore Count ---\n")
+
+# Target time points for the report
+report_times <- c(0, 50, 100, 180)
+
+# Define required columns for selection and their desired names in the table
+vars_to_select_and_rename <- c(
+  Time = "time",
+  `Human Infections (Cum.)` = "Cum_I_h",
+  `Human Deaths (Cum.)` = "D_h_disease_cumulative",
+  `Livestock Infections (Cum.)` = "Cum_I_l",
+  `Livestock Deaths (Cum.)` = "D_l_disease_cumulative",
+  `Wildlife Infections (Cum.)` = "Cum_I_w",
+  `Wildlife Deaths (Cum.)` = "D_w_disease_cumulative",
+  `Spore Count (B)` = "B"
+)
+placeholder_col_names <- names(vars_to_select_and_rename)[names(vars_to_select_and_rename) != "Time"]
+
+# Initialize an empty list to store data frames for each scenario
+all_scenarios_summary_list <- list()
+
+# Loop through each scenario's results
+for (scen_name in names(results_all_scenarios)) {
+  df_scen_results <- results_all_scenarios[[scen_name]]
+
+  if (!is.data.frame(df_scen_results) || nrow(df_scen_results) == 0) {
+    summary_for_scenario <- data.frame(Scenario = scen_name, Time = report_times)
+    for (col_name in placeholder_col_names) {
+      summary_for_scenario[[col_name]] <- NA_real_
+    }
+    summary_for_scenario <- summary_for_scenario %>% 
+        dplyr::select(Scenario, all_of(names(vars_to_select_and_rename))) 
+    all_scenarios_summary_list[[scen_name]] <- summary_for_scenario
+    next
+  }
+  
+  df_at_report_times <- df_scen_results %>%
+    dplyr::filter(time %in% report_times) 
+
+  source_cols_needed <- unname(vars_to_select_and_rename[names(vars_to_select_and_rename) != "Time"])
+  
+  if (nrow(df_at_report_times) > 0 && 
+      all(source_cols_needed %in% names(df_at_report_times)) &&
+      sum(!is.na(df_at_report_times[, source_cols_needed, drop = FALSE])) > 0) {
+    summary_for_scenario <- df_at_report_times %>%
+      dplyr::select(all_of(vars_to_select_and_rename)) %>% 
+      dplyr::mutate(Scenario = scen_name, .before = 1)    
+  } else {
+    summary_for_scenario <- data.frame(Scenario = scen_name, Time = report_times)
+    for (col_name in placeholder_col_names) {
+      summary_for_scenario[[col_name]] <- NA_real_
+    }
+    summary_for_scenario <- summary_for_scenario %>% 
+        dplyr::select(Scenario, all_of(names(vars_to_select_and_rename)))
+  }
+  all_scenarios_summary_list[[scen_name]] <- summary_for_scenario
+}
+
+# Combine all scenario summaries into one data frame
+final_summary_table <- dplyr::bind_rows(all_scenarios_summary_list) 
+
+# Define digit format for kable
+digits_vector <- c(NA, 0, 1, 0, 1, 0, 1, 0, 0)
+
+# Display the table using kable and kableExtra
+if (nrow(final_summary_table) > 0) {
+  knitr::kable(final_summary_table, 
+        caption = "Summary of Cumulative Infections, Cumulative Deaths, and Environmental Spore Count at Specific Time Points",
+        digits = digits_vector,
+        format.args = list(big.mark = ","), 
+        booktabs = TRUE,
+        row.names = FALSE) %>%
+    kableExtra::kable_styling(bootstrap_options = c("striped", "hover", "condensed", "responsive"), 
+                  full_width = FALSE,
+                  font_size = 9) %>% 
+    kableExtra::column_spec(1, bold = TRUE) %>% 
+    kableExtra::collapse_rows(columns = 1, valign = "top") %>% 
+    kableExtra::footnote(general = "Infections and Deaths are cumulative totals since the start of the outbreak. Spore Count (B) is in spores/cm³.",
+             general_title = "Note:",
+             footnote_as_chunk = TRUE,
+             escape = FALSE)
+}
+```
+#---Sensitivity analysis on parameters
+```{r}
+# --- Monte Carlo Sensitivity Analysis ---
+
+cat("\n\n--- Monte Carlo Sensitivity Analysis (50 Replicates per Scenario) ---\n")
+set.seed(123) # Set seed for reproducibility
+
+if (!exists("params_final_calibrated")) stop("Error: 'params_final_calibrated' not found.")
+
+num_replicates_mc <- 50
+
+# Define parameters to vary and their perturbation range (as proportion of baseline)
+mc_params_perturb_info <- list(
+  "LD50_env" = 0.20,                 # Baseline +/- 20%
+  "theta_spores" = 0.20,             # Baseline +/- 20%
+  "w_carcass_hyena_daily_kg" = 0.20, # Baseline +/- 20%
+  "gamma_to_spores" = 0.20,          # Baseline +/- 20%
+  "delta_B" = 0.20,                  # Baseline +/- 20% (Example of adding another)
+  "beta_hl" = 0.10,                  # Baseline +/- 10%
+  "psi_common" = 0.10                # Baseline +/- 10%
+)
+
+# Store all Monte Carlo SA results
+monte_carlo_results_all_scenarios <- list()
+
+# Loop through each of your 9 main scenarios
+for (scen_name_main in names(scenarios)) {
+  cat("\n--- Running Monte Carlo SA for Main Scenario:", scen_name_main, "---\n")
+  
+  main_scen_config <- scenarios[[scen_name_main]]
+  
+  params_scenario_baseline <- params_final_calibrated 
+  params_scenario_baseline$N_y <- main_scen_config$N_y
+  params_scenario_baseline$k_pred_l_per_hyena <- get_pred_rate(main_scen_config$k_l_target, params_const)
+  params_scenario_baseline$k_pred_w_per_hyena <- get_pred_rate(main_scen_config$k_w_target, params_const)
+
+  replicates_output_list <- vector("list", num_replicates_mc)
+
+  for (i in 1:num_replicates_mc) {
+    if (i %% 10 == 0) cat("  MC Replicate:", i, "of", num_replicates_mc, "for", scen_name_main, "\n")
+    
+    params_replicate <- params_scenario_baseline
+    perturbed_values_this_replicate <- list()
+
+    for (param_name in names(mc_params_perturb_info)) {
+      baseline_val <- params_scenario_baseline[[param_name]]
+      perturb_fraction <- mc_params_perturb_info[[param_name]]
+      
+      if (is.null(baseline_val)) {
+        next
+      }
+      
+      lower_bound_perturb <- baseline_val * (1 - perturb_fraction)
+      upper_bound_perturb <- baseline_val * (1 + perturb_fraction)
+      perturbed_val <- runif(1, min = lower_bound_perturb, max = upper_bound_perturb)
+      perturbed_val <- max(0, perturbed_val)
+      
+      params_replicate[[param_name]] <- perturbed_val
+      perturbed_values_this_replicate[[param_name]] <- perturbed_val
+
+      if (param_name == "psi_common") {
+        params_replicate$psi_l <- perturbed_val
+        params_replicate$psi_w <- perturbed_val
+      }
+    }
+    
+    sim_output_mc_rep <- tryCatch({
+      ode(y = initial_state_values, times = times, func = anthrax_model_ode, 
+          parms = params_replicate, method="lsoda", maxsteps=500000)
+    }, error = function(e) { NULL })
+    
+    if(is.null(sim_output_mc_rep)){
+        final_day_mc_rep <- data.frame(Cum_I_h=NA, Cum_I_l=NA, Cum_I_w=NA, B=NA)
+    } else {
+        final_day_mc_rep <- tail(as.data.frame(sim_output_mc_rep), 1)
+    }
+    
+    replicate_data <- data.frame(
+        replicate_num = i,
+        Cum_I_h = final_day_mc_rep$Cum_I_h,
+        Cum_I_l = final_day_mc_rep$Cum_I_l,
+        Cum_I_w = final_day_mc_rep$Cum_I_w,
+        Final_B = final_day_mc_rep$B
+    )
+    for(p_name in names(perturbed_values_this_replicate)){
+        replicate_data[[paste0("perturbed_", p_name)]] <- perturbed_values_this_replicate[[p_name]]
+    }
+    replicates_output_list[[i]] <- replicate_data
+  }
+  
+  monte_carlo_results_all_scenarios[[scen_name_main]] <- do.call(rbind, replicates_output_list)
+}
+cat("\n\n--- Monte Carlo Sensitivity Analysis Runs Complete ---\n")
+```
+#--- Summarize and Visualize Monte Carlo SA Results ---
+```{r}
+mc_summary_tables_list <- list()
+all_scenarios_mc_summary_df <- data.frame()
+
+cat("\n\n--- Summarizing Monte Carlo SA Results ---\n")
+
+for (scen_name_main in names(monte_carlo_results_all_scenarios)) {
+  scenario_mc_data <- monte_carlo_results_all_scenarios[[scen_name_main]]
+  
+  if(is.null(scenario_mc_data) || nrow(scenario_mc_data) == 0) {
+      next
+  }
+  
+  if (all(is.na(scenario_mc_data$Cum_I_h)) && all(is.na(scenario_mc_data$Cum_I_l)) && all(is.na(scenario_mc_data$Cum_I_w)) && all(is.na(scenario_mc_data$Final_B))) {
+      summary_stats_for_scenario <- data.frame(
+          Scenario = scen_name_main, Outcome = c("Cum_I_h", "Cum_I_l", "Cum_I_w", "Final_B"),
+          Mean = NA, Median = NA, P025 = NA, P975 = NA, N_successful_runs = 0
+      )
+      all_scenarios_mc_summary_df <- rbind(all_scenarios_mc_summary_df, summary_stats_for_scenario)
+      next
+  }
+
+  safe_quantile <- function(x, probs, na.rm = TRUE) { if (all(is.na(x))) NA_real_ else quantile(x, probs = probs, na.rm = na.rm) }
+  safe_mean <- function(x, na.rm = TRUE) { if (all(is.na(x))) NA_real_ else mean(x, na.rm = na.rm) }
+  safe_median <- function(x, na.rm = TRUE) { if (all(is.na(x))) NA_real_ else median(x, na.rm = na.rm) }
+
+  summary_stats_for_scenario <- data.frame(
+    Scenario = scen_name_main,
+    Outcome = c("Cum_I_h", "Cum_I_l", "Cum_I_w", "Final_B"),
+    Mean = c(safe_mean(scenario_mc_data$Cum_I_h), safe_mean(scenario_mc_data$Cum_I_l), safe_mean(scenario_mc_data$Cum_I_w), safe_mean(scenario_mc_data$Final_B)),
+    Median = c(safe_median(scenario_mc_data$Cum_I_h), safe_median(scenario_mc_data$Cum_I_l), safe_median(scenario_mc_data$Cum_I_w), safe_median(scenario_mc_data$Final_B)),
+    P025 = c(safe_quantile(scenario_mc_data$Cum_I_h, 0.025), safe_quantile(scenario_mc_data$Cum_I_l, 0.025), safe_quantile(scenario_mc_data$Cum_I_w, 0.025), safe_quantile(scenario_mc_data$Final_B, 0.025)),
+    P975 = c(safe_quantile(scenario_mc_data$Cum_I_h, 0.975), safe_quantile(scenario_mc_data$Cum_I_l, 0.975), safe_quantile(scenario_mc_data$Cum_I_w, 0.975), safe_quantile(scenario_mc_data$Final_B, 0.975)),
+    N_successful_runs = sum(!is.na(scenario_mc_data$Cum_I_h)) 
+  )
+  
+  all_scenarios_mc_summary_df <- rbind(all_scenarios_mc_summary_df, summary_stats_for_scenario)
+
+  plot_data_mc_long <- scenario_mc_data %>%
+    dplyr::select(Cum_I_h, Cum_I_l, Cum_I_w, Final_B) %>%
+    tidyr::pivot_longer(cols = everything(), names_to = "Outcome_Variable", values_to = "Value") %>%
+    filter(!is.na(Value)) 
+
+  if(nrow(plot_data_mc_long) > 0) {
+      p_mc_density <- ggplot(plot_data_mc_long, aes(x = Value)) +
+        geom_density(aes(fill = Outcome_Variable), alpha = 0.5) +
+        facet_wrap(~ Outcome_Variable, scales = "free") +
+        labs(title = paste("Outcome Distributions from MC SA for:", scen_name_main), x = "Outcome Value", y = "Density") +
+        theme_bw() +
+        theme(legend.position = "none", plot.title = element_text(hjust = 0.5, face="bold"), strip.text = element_text(face="bold"))
+      
+      print(p_mc_density)
+  }
+}
+
+cat("\n\n--- Combined Monte Carlo SA Summary Table ---\n")
+if (nrow(all_scenarios_mc_summary_df) > 0) {
+    cols_to_round <- c("Mean", "Median", "P025", "P975")
+    all_scenarios_mc_summary_df_display <- all_scenarios_mc_summary_df
+    all_scenarios_mc_summary_df_display[cols_to_round] <- lapply(all_scenarios_mc_summary_df_display[cols_to_round], round, digits = 2)
+
+    print(
+      kable(all_scenarios_mc_summary_df_display, 
+            caption = "Monte Carlo Sensitivity Analysis Summary for All Scenarios", 
+            format = "pipe",
+            align = 'lrrrrr') %>%
+        kable_styling(bootstrap_options = c("striped", "hover", "condensed", "responsive"), full_width = FALSE, font_size = 10) %>%
+        group_rows(index = table(factor(all_scenarios_mc_summary_df_display$Scenario, levels = names(scenarios))))
+    )
+}
+```
+#OPTIONAL: Aesthetically pleasing density plots
+```{r}
+#--- Summarize and Visualize Monte Carlo SA Results ---
+mc_summary_tables_list <- list()
+all_scenarios_mc_summary_df <- data.frame()
+
+cat("\n\n--- Summarizing Monte Carlo SA Results ---\n")
+
+for (scen_name_main in names(monte_carlo_results_all_scenarios)) {
+  scenario_mc_data <- monte_carlo_results_all_scenarios[[scen_name_main]]
+  
+  if(is.null(scenario_mc_data) || nrow(scenario_mc_data) == 0) {
+      next
+  }
+  
+  if (all(is.na(scenario_mc_data$Cum_I_h)) && all(is.na(scenario_mc_data$Cum_I_l)) && all(is.na(scenario_mc_data$Cum_I_w)) && all(is.na(scenario_mc_data$Final_B))) {
+      summary_stats_for_scenario <- data.frame(
+          Scenario = scen_name_main, Outcome = c("Cum_I_h", "Cum_I_l", "Cum_I_w", "Final_B"),
+          Mean = NA, Median = NA, P025 = NA, P975 = NA, N_successful_runs = 0
+      )
+      all_scenarios_mc_summary_df <- rbind(all_scenarios_mc_summary_df, summary_stats_for_scenario)
+      next
+  }
+
+  safe_quantile <- function(x, probs, na.rm = TRUE) { if (all(is.na(x))) NA_real_ else quantile(x, probs = probs, na.rm = na.rm) }
+  safe_mean <- function(x, na.rm = TRUE) { if (all(is.na(x))) NA_real_ else mean(x, na.rm = na.rm) }
+  safe_median <- function(x, na.rm = TRUE) { if (all(is.na(x))) NA_real_ else median(x, na.rm = na.rm) }
+
+  summary_stats_for_scenario <- data.frame(
+    Scenario = scen_name_main,
+    Outcome = c("Cum_I_h", "Cum_I_l", "Cum_I_w", "Final_B"),
+    Mean = c(safe_mean(scenario_mc_data$Cum_I_h), safe_mean(scenario_mc_data$Cum_I_l), safe_mean(scenario_mc_data$Cum_I_w), safe_mean(scenario_mc_data$Final_B)),
+    Median = c(safe_median(scenario_mc_data$Cum_I_h), safe_median(scenario_mc_data$Cum_I_l), safe_median(scenario_mc_data$Cum_I_w), safe_median(scenario_mc_data$Final_B)),
+    P025 = c(safe_quantile(scenario_mc_data$Cum_I_h, 0.025), safe_quantile(scenario_mc_data$Cum_I_l, 0.025), safe_quantile(scenario_mc_data$Cum_I_w, 0.025), safe_quantile(scenario_mc_data$Final_B, 0.025)),
+    P975 = c(safe_quantile(scenario_mc_data$Cum_I_h, 0.975), safe_quantile(scenario_mc_data$Cum_I_l, 0.975), safe_quantile(scenario_mc_data$Cum_I_w, 0.975), safe_quantile(scenario_mc_data$Final_B, 0.975)),
+    N_successful_runs = sum(!is.na(scenario_mc_data$Cum_I_h)) 
+  )
+  
+  all_scenarios_mc_summary_df <- rbind(all_scenarios_mc_summary_df, summary_stats_for_scenario)
+
+  # --- START OF EDITS TO MAKE PLOTS VISUALLY PLEASING ---
+  # 1. RENAME FACET HEADERS: We modify the 'Outcome_Variable' column before plotting.
+  # We convert it to a factor and provide new, more descriptive labels.
+  # The \n creates a line break for the long label.
+  plot_data_mc_long <- scenario_mc_data %>%
+    dplyr::select(Cum_I_h, Cum_I_l, Cum_I_w, Final_B) %>%
+    tidyr::pivot_longer(cols = everything(), names_to = "Outcome_Variable", values_to = "Value") %>%
+    filter(!is.na(Value)) %>%
+    dplyr::mutate(Outcome_Variable = factor(Outcome_Variable,
+        levels = c("Cum_I_h", "Cum_I_l", "Cum_I_w", "Final_B"),
+        labels = c("Cumulative Human Cases", 
+                   "Cumulative Livestock Cases", 
+                   "Cumulative Wild Herbivore Cases", 
+                   "Environmental Spore Load\n(spores/cm³)")
+    ))
+
+  if(nrow(plot_data_mc_long) > 0) {
+      p_mc_density <- ggplot(plot_data_mc_long, aes(x = Value)) +
+        geom_density(aes(fill = Outcome_Variable), alpha = 0.6, show.legend = FALSE) +
+        facet_wrap(~ Outcome_Variable, scales = "free") +
+        # 2. RENAME PLOT TITLE: The title is updated to your requested format.
+        labs(
+          title = paste("Distributions for MCSA for", scen_name_main), 
+          x = "Outcome Value", 
+          y = "Density"
+        ) +
+        theme_bw() +
+        # 3. REDUCE TEXT SIZE: We specify sizes for all key text elements.
+        theme(
+          legend.position = "none",
+          plot.title = element_text(hjust = 0.5, face = "bold", size = 8),
+          strip.text = element_text(face = "bold", size = 9), # Facet headers
+          axis.title = element_text(size = 10), # X and Y axis titles
+          axis.text = element_text(size = 8)   # X and Y axis tick labels
+        )
+      # --- END OF EDITS ---
+      
+      print(p_mc_density)
+  }
+}
+
+cat("\n\n--- Combined Monte Carlo SA Summary Table ---\n")
+if (nrow(all_scenarios_mc_summary_df) > 0) {
+    cols_to_round <- c("Mean", "Median", "P025", "P975")
+    all_scenarios_mc_summary_df_display <- all_scenarios_mc_summary_df
+    all_scenarios_mc_summary_df_display[cols_to_round] <- lapply(all_scenarios_mc_summary_df_display[cols_to_round], round, digits = 2)
+
+    print(
+      kable(all_scenarios_mc_summary_df_display, 
+            caption = "Monte Carlo Sensitivity Analysis Summary for All Scenarios", 
+            format = "pipe",
+            align = 'lrrrrr') %>%
+        kable_styling(bootstrap_options = c("striped", "hover", "condensed", "responsive"), full_width = FALSE, font_size = 10) %>%
+        group_rows(index = table(factor(all_scenarios_mc_summary_df_display$Scenario, levels = names(scenarios))))
+    )
+}
+```
+
+
+
