@@ -1,5 +1,5 @@
 ---
-title: "JULY 1 HYENA CODE FOR MANUSCRIPT"
+title: "A One Health model evaluating the role of a wild carnivore in mitigating multi-host anthrax outbreaks"
 author: "Stephanie Mitchell"
 date: "2025-06-21"
 output: html_document
