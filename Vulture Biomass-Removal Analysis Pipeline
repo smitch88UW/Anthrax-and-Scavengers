@@ -1,659 +1,643 @@
----
-title: "Vulture Biomass-Removal Analysis Pipeline"
-author: "Stephanie Mitchell"
-date: "March 2026`"
-output: html_document
----
+# ============================================================================
+# Individual variation in vulture use of an anthrax outbreak
+# Reproducible analysis: visitation, unique bird-day biomass removal,
+# benchmark sensitivity analyses, and gross/edible biomass figures.
+#
+# Primary analysis: 100% gross carcass biomass.
+# Sensitivity analysis: 55% edible carcass biomass (Houston 1979 assumption).
+#
+# REQUIRED INPUTS: Edit the placeholder filenames in the INPUT FILES section.
+# Do not include restricted wildlife telemetry in a public code repository.
+#
+# RUN (from the project directory):
+#   Rscript Vulture_Anthrax_Analysis.R
+# Or specify data and output directories:
+#   Rscript Vulture_Anthrax_Analysis.R /path/to/data /path/to/outputs
+#
+# Packages: dplyr, tidyr, sf, readr, lubridate, ggplot2, scales.
+# ============================================================================
 
-# Read Me: How to use this file
-
-This RMD was constructed for partial data analysis during the preparation of [FILL IN MANUSCRIPT TITLE]. The workflows in this file are intended to estimate the potential epidemiological impact that vultures may have during an anthrax outbreak, through removal of biomass from large mammal carcasses.
-
-**Before running this pipeline, you will need:**
-
-- A carcass pool dataset with pool IDs, coordinates (UTM recommended), and total dead counts per pool
-- A vulture GPS dataset with bird IDs, timestamps, and location coordinates
-- R packages: `dplyr`, `sf`, `readr`, `ggplot2`, `scales`, `tidyr`
-
-**User-defined inputs to update before running:**
-
-- `DATADIR`: path to your data directory
-- File names for your carcass and vulture datasets
-- `DIST_THRESHOLD`: your chosen distance threshold (m) for classifying a foraging visit
-- `D`: your analysis window in days
-- Body mass and intake rate assumptions appropriate for your study species
-
----
-
-## Setup
-
-```{r setup, message=FALSE, warning=FALSE}
 library(dplyr)
 library(sf)
 library(readr)
+library(lubridate)
+library(tidyr)
 library(ggplot2)
 library(scales)
-library(tidyr)
 
-# ── USER-DEFINED INPUTS ───────────────────────────────────────────────────────
-# Set your data directory
-DATADIR <- "path/to/your/data/directory"
+args <- commandArgs(trailingOnly = TRUE)
+DATA_DIR <- if (length(args) >= 1L) args[[1L]] else "data"
+DATADIR <- if (length(args) >= 2L) args[[2L]] else "outputs"
+dir.create(DATADIR, recursive = TRUE, showWarnings = FALSE)
 
-# Distance threshold (m) for classifying a GPS fix as a foraging visit
-# We used 500m for white-backed vultures at hippo carcass pools
-DIST_THRESHOLD <- 500
+WINDOW_START <- as.Date("2017-08-17")
+WINDOW_END   <- as.Date("2017-11-27")
+D <- as.integer(WINDOW_END - WINDOW_START) + 1L
+stopifnot(D == 103L)
+EXCLUDE_BIRDS <- c(163113)
 
-# Analysis window in days
-# Set to your outbreak period + any post-outbreak buffer you wish to include
-D <- 103  # e.g., 73-day outbreak + 30-day post-outbreak buffer
+# Model assumptions; hippo body masses are scenario inputs, not measured masses.
+M_low <- 1386.0
+M_mid <- 1461.0
+M_high <- 1536.0
+U_low <- 0.315
+U_mid <- 0.500
+U_high <- 1.000
+BONE_FRACTION <- 0.45
+EDIBLE_FRACTION <- 1 - BONE_FRACTION
 
-# ── BODY MASS SCENARIOS (kg per carcass) ─────────────────────────────────────
-# Replace with values appropriate for your study species
-# Low:  lower bound estimate (cite source)
-# Mid:  midpoint (average of low and high)
-# High: upper bound estimate (cite source)
-M_low  <- 0000.0   # e.g., Eltringham 1999 for hippo
-M_mid  <- 0000.0
-M_high <- 0000.0
-
-# ── DAILY VULTURE INTAKE SCENARIOS (kg/vulture/day) ──────────────────────────
-# Replace with values appropriate for your study species
-# Low:  conservative estimate (cite source)
-# Mid:  midpoint field estimate (cite source)
-# High: upper bound estimate (cite source)
-U_low  <- 0.000   # e.g., Houston 1976
-U_mid  <- 0.000   # e.g., Ruxton & Houston 2002
-U_high <- 0.000   # e.g., Brink et al. 2020
-```
-
----
-
-# Step 1: Calculate vulture distance to each carcass pool
-
-**Purpose:** Identify GPS fixes that fall within your chosen distance threshold of each carcass pool, and use these to classify foraging visits.
-
-**Determine a meaningful visit distance threshold** for your study species that would constitute a foraging visit (e.g., we used <500 m for white-backed vultures at hippo carcass pools). Match birds to pools using UTM coordinates rather than lat/long to avoid coordinate distortion errors.
-
-**Archetype definitions used in this pipeline:**
-
-| Archetype | Definition |
-|---|---|
-| Super user | ≥100 total within-threshold GPS fixes |
-| Moderate user | <100 total within-threshold fixes AND ≥3 unique pools visited |
-| Limited user | 1–2 unique pools visited |
-| Non user | 0 within-threshold fixes at any pool |
-
-*Adjust these thresholds to suit your data and study system.*
-
-**Datasets needed:**
-- Carcass pool file: pool IDs, UTM coordinates (or lat/long for conversion), total dead per pool
-- Vulture GPS file: bird IDs, timestamps, location coordinates
-
-```{r step1-load-pools}
-# ── LOAD CARCASS POOL COORDINATES ─────────────────────────────────────────────
-# Replace "your_carcass_pool_file.csv" with your file name
-# Required columns: pool ID, UTM x, UTM y (or lat/long), total dead
-carcass_pools <- read_csv(
-  file.path(DATADIR, "your_carcass_pool_file.csv"),
-  show_col_types = FALSE
+# ============================================================================
+# 1. GPS FIX ASSIGNMENT AND POOL VISITATION
+# ============================================================================
+pool_letter_map <- tibble(
+  hippo_pool = c(1, 3, 4, 2, 5, 10, 8, 9, 6, 7),
+  pool_letter = LETTERS[1:10]
 ) %>%
-  filter(!is.na(utm_x)) %>%            # remove rows with missing coordinates
+  mutate(pool_label = if_else(pool_letter %in% c("A", "B"),
+                              "A/B", pool_letter))
+
+# INPUT FILES: Replace these placeholders with your locally available filenames.
+# Expected CSV column names are described in README.md.
+POOL_INPUT_FILENAME <- "YOUR_HIPPO_CARCASS_DATA.csv"
+GPS_INPUT_FILENAME  <- "YOUR_VULTURE_GPS_DATA.csv"
+
+pool_file <- file.path(DATA_DIR, POOL_INPUT_FILENAME)
+gps_file  <- file.path(DATA_DIR, GPS_INPUT_FILENAME)
+if (!file.exists(pool_file)) stop("Missing hippo pool input: ", pool_file)
+if (!file.exists(gps_file)) stop("Missing GPS input (not bundled with public code): ", gps_file)
+
+hippo_pools <- read_csv(pool_file, show_col_types = FALSE) %>%
+  filter(!is.na(utm_x), !is.na(utm_y)) %>%
   transmute(
-    pool_id    = pool_id_column,        # replace with your pool ID column name
-    pool_utm_x = utm_x_column,          # replace with your UTM x column name
-    pool_utm_y = utm_y_column,          # replace with your UTM y column name
-    total_dead = total_dead_column      # replace with your dead count column name
-  )
-
-cat("=== CARCASS POOLS ===\n")
-print(carcass_pools)
-cat("Total pools:", nrow(carcass_pools), "\n")
-cat("Total dead across all pools:", sum(carcass_pools$total_dead), "\n")
-```
-
-```{r step1-verify-coordinates}
-# ── OPTIONAL: VERIFY UTM COORDINATES AGAINST LAT/LONG CONVERSION ──────────────
-# If you have both UTM and lat/long stored, verify they match
-# Skip this block if you only have one coordinate format
-
-# Build pool sf from stored UTM
-pools_sf_utm <- carcass_pools %>%
-  st_as_sf(coords = c("pool_utm_x", "pool_utm_y"), crs = 32736)  # update EPSG for your UTM zone
-
-# Build pool sf from lat/long and convert to UTM
-pools_sf_latlong <- carcass_pools %>%
-  st_as_sf(coords = c("pool_lon", "pool_lat"), crs = 4326) %>%   # update if column names differ
-  st_transform(32736)                                              # update EPSG for your UTM zone
-
-# Compare stored vs derived UTM — should be <1m difference if coordinates are correct
-coords_stored  <- st_coordinates(pools_sf_utm)
-coords_derived <- st_coordinates(pools_sf_latlong)
-
-verification <- carcass_pools %>%
-  select(pool_id, pool_utm_x, pool_utm_y) %>%
-  mutate(
-    derived_utm_x = coords_derived[, 1],
-    derived_utm_y = coords_derived[, 2],
-    diff_x_m      = abs(pool_utm_x - derived_utm_x),
-    diff_y_m      = abs(pool_utm_y - derived_utm_y)
-  )
-
-cat("=== UTM VERIFICATION: STORED vs DERIVED FROM LAT/LONG ===\n")
-print(verification)
-cat("Max X difference (m):", max(verification$diff_x_m), "\n")
-cat("Max Y difference (m):", max(verification$diff_y_m), "\n")
-```
-
-```{r step1-load-vultures}
-# ── LOAD VULTURE GPS DATA ──────────────────────────────────────────────────────
-# Replace "your_vulture_gps_file.csv" with your file name
-# Required columns: bird ID, timestamp, longitude, latitude
-vulture_df <- read_csv(
-  file.path(DATADIR, "your_vulture_gps_file.csv"),
-  show_col_types = FALSE
-) %>%
-  transmute(
-    bird_id    = bird_id_column,              # replace with your bird ID column name
-    date       = as.Date(timestamp_column),   # replace with your timestamp column name
-    lon        = longitude_column,            # replace with your longitude column name
-    lat        = latitude_column              # replace with your latitude column name
+    hippo_pool = hippo_pool,
+    pool_utm_x = utm_x,
+    pool_utm_y = utm_y,
+    total_dead = total_dead
   ) %>%
-  filter(!is.na(lon), !is.na(lat))
+  left_join(pool_letter_map, by = "hippo_pool")
+stopifnot(nrow(hippo_pools) == 10,
+          n_distinct(hippo_pools$hippo_pool) == 10,
+          !anyNA(hippo_pools$pool_label),
+          sum(hippo_pools$total_dead) == 67)
 
-cat("=== VULTURE GPS DATA ===\n")
-cat("Total rows:", nrow(vulture_df), "\n")
-cat("Unique birds:", n_distinct(vulture_df$bird_id), "\n")
-cat("Date range:", as.character(min(vulture_df$date)),
-    "to", as.character(max(vulture_df$date)), "\n")
+raw_gps <- read_csv(gps_file, show_col_types = FALSE)
+if (!inherits(raw_gps$timestamp, "POSIXct")) {
+  raw_gps <- raw_gps %>%
+    mutate(timestamp = as.POSIXct(timestamp, tz = "UTC"))
+}
+stopifnot(!anyNA(raw_gps$timestamp))
 
-# NOTE: Check your date range against your outbreak window.
-# If your GPS data starts after outbreak onset, note this as a limitation —
-# removal estimates will be conservative lower bounds for the uncovered period.
-```
+vulture_df_raw <- raw_gps %>%
+  mutate(
+    timestamp_local = with_tz(timestamp, "Africa/Dar_es_Salaam"),
+    hour_local = hour(timestamp_local),
+    date_local = as.Date(timestamp_local)
+  ) %>%
+  filter(
+    !`tag-local-identifier` %in% EXCLUDE_BIRDS,
+    hour_local >= 7, hour_local <= 16,
+    date_local >= WINDOW_START, date_local <= WINDOW_END,
+    !is.na(`location-long`), !is.na(`location-lat`)
+  ) %>%
+  mutate(gps_fix_id = row_number())
 
-```{r step1-calculate-distances}
-# ── CONVERT VULTURE POINTS TO UTM ─────────────────────────────────────────────
-vulture_sf <- vulture_df %>%
-  st_as_sf(coords = c("lon", "lat"), crs = 4326) %>%
-  st_transform(32736)   # update EPSG to match your UTM zone
+vulture_sf <- st_as_sf(
+  vulture_df_raw,
+  coords = c("location-long", "location-lat"),
+  crs = 4326,
+  remove = FALSE
+) %>% st_transform(32736)
+coords <- st_coordinates(vulture_sf)
 
-# ── CALCULATE DISTANCES: EVERY VULTURE FIX TO EVERY POOL ─────────────────────
-cat("Calculating distances from all GPS fixes to all pools...\n")
+vulture_df <- tibble(
+  gps_fix_id = vulture_df_raw$gps_fix_id,
+  bird_id = vulture_df_raw$`tag-local-identifier`,
+  date = vulture_df_raw$date_local,
+  time = vulture_df_raw$hour_local,
+  utm_x = coords[, 1],
+  utm_y = coords[, 2]
+)
+stopifnot(n_distinct(vulture_df$bird_id) == 7L)
 
-results <- lapply(seq_len(nrow(pools_sf_utm)), function(i) {
-  dists <- as.numeric(st_distance(vulture_sf, pools_sf_utm[i, ]))
+# Assign each raw GPS fix to a single nearest pool if within 500 m.
+# A and B remain distinct candidates, then combine for summaries.
+results <- bind_rows(lapply(seq_len(nrow(hippo_pools)), function(i) {
   vulture_df %>%
     mutate(
-      pool_id        = carcass_pools$pool_id[i],
-      total_dead     = carcass_pools$total_dead[i],
-      dist_m         = dists,
-      within_thresh  = dist_m <= DIST_THRESHOLD
+      hippo_pool = hippo_pools$hippo_pool[i],
+      total_dead = hippo_pools$total_dead[i],
+      dist_m = sqrt((utm_x - hippo_pools$pool_utm_x[i])^2 +
+                    (utm_y - hippo_pools$pool_utm_y[i])^2)
     )
-}) %>% bind_rows()
+})) %>%
+  left_join(pool_letter_map, by = "hippo_pool") %>%
+  arrange(gps_fix_id, dist_m, hippo_pool) %>%
+  group_by(gps_fix_id) %>%
+  mutate(
+    within_500m = dist_m <= 500,
+    visit_pool = row_number() == 1L & within_500m
+  ) %>%
+  ungroup()
+stopifnot(nrow(results) == nrow(vulture_df) * nrow(hippo_pools),
+          all(results %>% group_by(gps_fix_id) %>%
+                summarise(n_assigned = sum(visit_pool), .groups = "drop") %>%
+                pull(n_assigned) <= 1L))
 
-cat("Distance calculation complete.\n")
-```
-
-```{r step1-summarize-visits}
-# ── BIRD x POOL VISIT SUMMARY ──────────────────────────────────────────────────
+# Visitation statistic: one count per bird x pool x date.
 bird_pool_binary <- results %>%
-  group_by(bird_id, pool_id, total_dead) %>%
+  group_by(bird_id, pool_label) %>%
   summarise(
-    visited       = as.integer(any(within_thresh)),
-    n_fixes       = sum(within_thresh),
-    n_days        = n_distinct(date[within_thresh]),
-    .groups       = "drop"
+    visited_500m = as.integer(any(visit_pool)),
+    n_fixes_500m = sum(visit_pool),
+    n_days_500m = n_distinct(date[visit_pool]),
+    .groups = "drop"
+  ) %>%
+  left_join(hippo_pools %>%
+              group_by(pool_label) %>%
+              summarise(total_dead = sum(total_dead), .groups = "drop"),
+            by = "pool_label")
+
+bird_pool_binary_10pool <- results %>%
+  group_by(bird_id, hippo_pool, pool_letter, total_dead) %>%
+  summarise(
+    visited_500m = as.integer(any(visit_pool)),
+    n_fixes_500m = sum(visit_pool),
+    n_days_500m = n_distinct(date[visit_pool]),
+    .groups = "drop"
   )
 
-cat("=== BIRD x POOL VISIT TABLE (visited pools only) ===\n")
-print(bird_pool_binary %>% filter(visited == 1), n = Inf)
-
-# ── ASSIGN ARCHETYPES ─────────────────────────────────────────────────────────
-# Adjust thresholds below to suit your data
+# Descriptive pool-bird visit-days may exceed unique bird-calendar-days.
 bird_summary <- bird_pool_binary %>%
   group_by(bird_id) %>%
   summarise(
-    total_fixes          = sum(n_fixes),
-    total_days           = sum(n_days),
-    n_unique_pools       = sum(visited),
-    pools_visited        = paste(sort(pool_id[visited == 1]), collapse = ", "),
-    .groups              = "drop"
-  ) %>%
-  mutate(
-    archetype = case_when(
-      total_fixes == 0                              ~ "Non user",
-      total_fixes >= 100                            ~ "Super user",      # adjust threshold
-      n_unique_pools >= 3 & total_fixes < 100       ~ "Moderate user",   # adjust thresholds
-      n_unique_pools %in% c(1, 2)                   ~ "Limited user",
-      TRUE                                          ~ "Limited user"
-    )
-  ) %>%
-  arrange(desc(total_fixes))
-
-cat("\n=== PER-BIRD SUMMARY WITH ARCHETYPES ===\n")
-print(bird_summary, n = Inf)
-
-# ── SAVE ──────────────────────────────────────────────────────────────────────
-write_csv(bird_pool_binary, file.path(DATADIR, "output_bird_pool_visit_binary.csv"))
-write_csv(bird_summary,     file.path(DATADIR, "output_bird_summary_archetypes.csv"))
-cat("\nSaved: output_bird_pool_visit_binary.csv\n")
-cat("Saved: output_bird_summary_archetypes.csv\n")
-```
-
----
-
-# Step 2: Estimate pool biomass and model vulture removal
-
-**Purpose:** Calculate total carcass biomass per pool under three body-mass scenarios, then model how much biomass each tagged bird could have removed based on their GPS-derived foraging visit patterns.
-
-**Key assumption:** Biomass removal is credited on days a bird records at least one within-threshold GPS fix. Daily removal is capped at the scenario-specific intake rate and allocated across pools in proportion to within-threshold fix counts.
-
-```{r step2-pool-biomass}
-# ── TOTAL BIOMASS PER POOL ────────────────────────────────────────────────────
-pool_biomass <- carcass_pools %>%
-  mutate(
-    biomass_low  = total_dead * M_low,
-    biomass_mid  = total_dead * M_mid,
-    biomass_high = total_dead * M_high
+    visit_location_counts = sum(n_fixes_500m),
+    pool_bird_visit_days = sum(n_days_500m),
+    n_unique_pools_visited = sum(visited_500m),
+    pools_visited = paste(sort(pool_label[visited_500m == 1]), collapse = ", "),
+    .groups = "drop"
   )
 
-cat("=== TOTAL BIOMASS PER POOL ===\n")
-print(pool_biomass)
-
-cat("\n=== TOTAL OUTBREAK BIOMASS (ALL POOLS) ===\n")
-cat("Low:  ", sum(pool_biomass$biomass_low),  "kg\n")
-cat("Mid:  ", sum(pool_biomass$biomass_mid),  "kg\n")
-cat("High: ", sum(pool_biomass$biomass_high), "kg\n")
-```
-
-```{r step2-model-removal}
-# ── MODELED VULTURE REMOVAL PER BIRD PER POOL ─────────────────────────────────
-# Total visit-days per bird across all pools
-bird_total_days <- bird_pool_binary %>%
-  group_by(bird_id) %>%
-  summarise(total_visit_days = sum(n_days), .groups = "drop")
-
-# Allocate removal across pools proportional to within-threshold fix counts
-bird_pool_removal <- bird_pool_binary %>%
-  left_join(bird_total_days, by = "bird_id") %>%
-  mutate(
-    visit_share  = ifelse(total_visit_days > 0, n_days / total_visit_days, 0),
-    removal_low  = visit_share * U_low  * total_visit_days,
-    removal_mid  = visit_share * U_mid  * total_visit_days,
-    removal_high = visit_share * U_high * total_visit_days
-  )
-
-cat("=== MODELED REMOVAL PER BIRD PER POOL (active pools only) ===\n")
-print(bird_pool_removal %>%
-        filter(n_days > 0) %>%
-        select(bird_id, pool_id, n_days, visit_share,
-               removal_low, removal_mid, removal_high),
-      n = Inf)
-```
-
-```{r step2-pool-summary}
-# ── REMAINING BIOMASS PER POOL ────────────────────────────────────────────────
-pool_removal_total <- bird_pool_removal %>%
-  group_by(pool_id) %>%
+pool_use_stats <- bird_pool_binary %>%
+  group_by(pool_label, total_dead) %>%
   summarise(
-    total_removal_low  = sum(removal_low,  na.rm = TRUE),
-    total_removal_mid  = sum(removal_mid,  na.rm = TRUE),
-    total_removal_high = sum(removal_high, na.rm = TRUE),
+    pool_visit_days = sum(n_days_500m),
+    pool_visit_locations = sum(n_fixes_500m),
+    n_birds_visiting = sum(visited_500m),
+    .groups = "drop"
+  ) %>% arrange(pool_label)
+
+if (sum(pool_use_stats$pool_visit_days) != 114L ||
+    sum(pool_use_stats$pool_visit_locations) != 336L) {
+  warning("2017 visitation differs from reference output (114 pool-bird-days / 336 fixes). Check data input.")
+}
+
+cor_dead_vs_days <- cor.test(pool_use_stats$total_dead,
+                             pool_use_stats$pool_visit_days,
+                             method = "spearman", exact = FALSE)
+cor_dead_vs_locs <- cor.test(pool_use_stats$total_dead,
+                             pool_use_stats$pool_visit_locations,
+                             method = "spearman", exact = FALSE)
+write_csv(bird_pool_binary, file.path(DATADIR, "bird_pool_visitation_9pool.csv"))
+write_csv(bird_pool_binary_10pool, file.path(DATADIR, "bird_pool_visitation_10pool.csv"))
+write_csv(pool_use_stats, file.path(DATADIR, "pool_use_vs_carcass.csv"))
+
+
+# ============================================================================
+# 2. UNIQUE BIRD-DAY ALLOCATION AND BIOMASS MODEL
+# ============================================================================
+
+daily_pool_fixes <- results %>%
+  filter(visit_pool) %>%
+  count(bird_id, date, pool_label, name = "n_fixes_at_pool") %>%
+  group_by(bird_id, date) %>%
+  mutate(
+    n_pools_that_day = n(),
+    fix_share = n_fixes_at_pool / sum(n_fixes_at_pool),
+    removal_low  = U_low * fix_share,
+    removal_mid  = U_mid * fix_share,
+    removal_high = U_high * fix_share
+  ) %>% ungroup()
+
+bird_day_audit <- daily_pool_fixes %>%
+  distinct(bird_id, date, n_pools_that_day) %>%
+  summarise(
+    unique_bird_days = n(),
+    pool_bird_days = sum(n_pools_that_day),
+    multi_pool_bird_days = sum(n_pools_that_day > 1L),
+    excess_pool_days = sum(n_pools_that_day - 1L)
+  )
+if (bird_day_audit$unique_bird_days != 112L ||
+    bird_day_audit$pool_bird_days != 114L) {
+  warning("Active bird-calendar-days or pool-bird-days differ from the validated reference (112 / 114).")
+}
+# Check actual one-intake-per-bird-day allocation.
+check_daily <- daily_pool_fixes %>%
+  group_by(bird_id, date) %>%
+  summarise(fix_share_sum = sum(fix_share),
+            removal_low_sum = sum(removal_low),
+            removal_mid_sum = sum(removal_mid),
+            removal_high_sum = sum(removal_high), .groups = "drop")
+stopifnot(all(abs(check_daily$fix_share_sum - 1) < 1e-10),
+          all(abs(check_daily$removal_low_sum - U_low) < 1e-10),
+          all(abs(check_daily$removal_mid_sum - U_mid) < 1e-10),
+          all(abs(check_daily$removal_high_sum - U_high) < 1e-10),
+          sum(pool_use_stats$pool_visit_days) == bird_day_audit$pool_bird_days)
+
+# Retain descriptive pool-bird visit-days separately;
+# unique calendar days govern the biomass model and its archetypes.
+bird_unique_days <- daily_pool_fixes %>%
+  distinct(bird_id, date) %>%
+  count(bird_id, name = "unique_active_days")
+
+bird_summary_model <- bird_summary %>%
+  left_join(bird_unique_days, by = "bird_id") %>%
+  mutate(
+    unique_active_days = coalesce(unique_active_days, 0L),
+    archetype = case_when(
+      unique_active_days >= 25L ~ "Super user",
+      unique_active_days >= 8L ~ "Moderate user",
+      unique_active_days >= 1L ~ "Limited user",
+      TRUE ~ "Non user"
+    )
+  ) %>% arrange(desc(unique_active_days))
+
+bird_pool_removal <- daily_pool_fixes %>%
+  group_by(bird_id, pool_label) %>%
+  summarise(
+    pool_visit_days = n(),
+    n_fixes_500m = sum(n_fixes_at_pool),
+    removal_low = sum(removal_low),
+    removal_mid = sum(removal_mid),
+    removal_high = sum(removal_high),
+    .groups = "drop"
+  )
+
+# Pool count x weights, with 45% discount only for sensitivity.
+pool_biomass <- hippo_pools %>%
+  group_by(pool_label) %>%
+  summarise(total_dead = sum(total_dead), .groups = "drop") %>%
+  mutate(
+    biomass_low = total_dead * M_low,
+    biomass_mid = total_dead * M_mid,
+    biomass_high = total_dead * M_high,
+    edible_low = biomass_low * EDIBLE_FRACTION,
+    edible_mid = biomass_mid * EDIBLE_FRACTION,
+    edible_high = biomass_high * EDIBLE_FRACTION
+  )
+
+pool_removal_total <- bird_pool_removal %>%
+  group_by(pool_label) %>%
+  summarise(
+    total_removal_low = sum(removal_low),
+    total_removal_mid = sum(removal_mid),
+    total_removal_high = sum(removal_high),
     .groups = "drop"
   )
 
 pool_q1_summary <- pool_biomass %>%
-  left_join(pool_removal_total, by = "pool_id") %>%
+  left_join(pool_removal_total, by = "pool_label") %>%
   mutate(
-    across(starts_with("total_removal"), ~replace_na(., 0)),
-    remaining_low  = pmax(0, biomass_low  - total_removal_low),
-    remaining_mid  = pmax(0, biomass_mid  - total_removal_mid),
+    across(starts_with("total_removal"), ~ replace_na(.x, 0)),
+    remaining_low = pmax(0, biomass_low - total_removal_low),
+    remaining_mid = pmax(0, biomass_mid - total_removal_mid),
     remaining_high = pmax(0, biomass_high - total_removal_high)
   )
 
-cat("=== FULL POOL SUMMARY: BIOMASS INPUT, REMOVAL, REMAINING ===\n")
-print(pool_q1_summary, n = Inf)
-
-cat("\n=== TOTALS ACROSS ALL POOLS (midpoint scenario) ===\n")
-cat("Total biomass input:    ", sum(pool_q1_summary$biomass_mid),       "kg\n")
-cat("Total modeled removal:  ", sum(pool_q1_summary$total_removal_mid),  "kg\n")
-cat("Total remaining:        ", sum(pool_q1_summary$remaining_mid),      "kg\n")
-cat("Percent removed:        ",
-    round(100 * sum(pool_q1_summary$total_removal_mid) /
-            sum(pool_q1_summary$biomass_mid), 2), "%\n")
-
-# ── SAVE ──────────────────────────────────────────────────────────────────────
-write_csv(pool_biomass,      file.path(DATADIR, "output_pool_biomass_totals.csv"))
-write_csv(pool_q1_summary,   file.path(DATADIR, "output_pool_biomass_removal_summary.csv"))
-write_csv(bird_pool_removal, file.path(DATADIR, "output_bird_pool_removal.csv"))
-cat("\nSaved: output_pool_biomass_totals.csv\n")
-cat("Saved: output_pool_biomass_removal_summary.csv\n")
-cat("Saved: output_bird_pool_removal.csv\n")
-```
-
----
-
-# Step 3: Archetype-level removal and descriptive correlations
-
-**Purpose:** Summarize modeled biomass removal by behavioral archetype, add a hypothetical daily carcass user as a theoretical upper bound, and describe the association between use-intensity metrics and removal potential using Spearman rank correlation. Given small sample sizes typical of GPS tracking studies, this is treated as a descriptive analysis rather than a formal statistical test.
-
-```{r step3-archetype-removal}
-# ── PER-BIRD REMOVAL TOTALS BY ARCHETYPE ──────────────────────────────────────
-B_low  <- sum(pool_q1_summary$biomass_low)
-B_mid  <- sum(pool_q1_summary$biomass_mid)
-B_high <- sum(pool_q1_summary$biomass_high)
-
-bird_archetype_removal <- bird_summary %>%
-  select(bird_id, total_fixes, total_days, n_unique_pools, archetype) %>%
+bird_archetype_removal <- bird_summary_model %>%
   mutate(
-    total_removal_low  = total_days * U_low,
-    total_removal_mid  = total_days * U_mid,
-    total_removal_high = total_days * U_high,
-    pct_days_active    = round(100 * total_days / D, 1)
+    removal_low_kg = unique_active_days * U_low,
+    removal_mid_kg = unique_active_days * U_mid,
+    removal_high_kg = unique_active_days * U_high
   )
 
-cat("=== PER-BIRD ARCHETYPE REMOVAL SUMMARY ===\n")
-print(bird_archetype_removal, n = Inf)
-
-# ── ARCHETYPE-LEVEL SUMMARY ───────────────────────────────────────────────────
-archetype_summary <- bird_archetype_removal %>%
+# Mean days must NOT be rounded before the projection.
+archetype_summary_model <- bird_archetype_removal %>%
   group_by(archetype) %>%
   summarise(
-    n_birds              = n(),
-    mean_fixes           = round(mean(total_fixes), 1),
-    mean_days_active     = round(mean(total_days), 1),
-    mean_removal_low_kg  = round(mean(total_removal_low), 2),
-    mean_removal_mid_kg  = round(mean(total_removal_mid), 2),
-    mean_removal_high_kg = round(mean(total_removal_high), 2),
-    total_removal_low_kg = round(sum(total_removal_low), 2),
-    total_removal_mid_kg = round(sum(total_removal_mid), 2),
-    total_removal_high_kg= round(sum(total_removal_high), 2),
+    n_birds = n(),
+    mean_days_active = mean(unique_active_days),
+    mean_visit_locations = mean(visit_location_counts),
+    mean_removal_low_kg = mean(removal_low_kg),
+    mean_removal_mid_kg = mean(removal_mid_kg),
+    mean_removal_high_kg = mean(removal_high_kg),
+    total_removal_low_kg = sum(removal_low_kg),
+    total_removal_mid_kg = sum(removal_mid_kg),
+    total_removal_high_kg = sum(removal_high_kg),
     .groups = "drop"
-  ) %>%
-  arrange(desc(mean_removal_mid_kg))
-
-cat("\n=== ARCHETYPE-LEVEL SUMMARY ===\n")
-print(archetype_summary, n = Inf)
-
-cat("\n=== ARCHETYPE REMOVAL AS % OF TOTAL OUTBREAK BIOMASS ===\n")
-archetype_summary %>%
-  mutate(
-    pct_removed_low  = round(100 * total_removal_low_kg  / B_low,  3),
-    pct_removed_mid  = round(100 * total_removal_mid_kg  / B_mid,  3),
-    pct_removed_high = round(100 * total_removal_high_kg / B_high, 3)
-  ) %>%
-  select(archetype, n_birds, total_removal_mid_kg,
-         pct_removed_low, pct_removed_mid, pct_removed_high) %>%
-  print(n = Inf)
-```
-
-```{r step3-hypothetical-user}
-# ── ADD HYPOTHETICAL DAILY CARCASS USER ───────────────────────────────────────
-# This represents a bird present at a carcass pool on every day of the
-# analysis window — a theoretical upper bound on individual removal capacity.
-# Adjust n_unique_pools to match the pools actually visited in your data.
-
-bird_q3 <- bird_summary %>%
-  select(bird_id, total_fixes, total_days, n_unique_pools, pools_visited, archetype) %>%
-  mutate(
-    total_removal_low_kg  = total_days * U_low,
-    total_removal_mid_kg  = total_days * U_mid,
-    total_removal_high_kg = total_days * U_high,
-    pct_days_active       = round(100 * total_days / D, 1),
-    pct_biomass_removed_mid = round(100 * total_removal_mid_kg / B_mid, 4),
-    is_hypothetical       = FALSE
   )
 
+# Independent cross-check: all bird allocations equal the model totals.
+stopifnot(
+  abs(sum(pool_q1_summary$total_removal_mid) -
+        sum(bird_archetype_removal$removal_mid_kg)) < 1e-8,
+  abs(sum(pool_q1_summary$total_removal_mid) -
+        nrow(check_daily) * U_mid) < 1e-8,
+  sum(pool_biomass$total_dead) == 67
+)
+
+write_csv(daily_pool_fixes, file.path(DATADIR, "daily_pool_fix_allocation.csv"))
+write_csv(bird_summary_model, file.path(DATADIR, "bird_summary_unique_days.csv"))
+write_csv(bird_pool_removal, file.path(DATADIR, "bird_pool_removal.csv"))
+write_csv(pool_biomass, file.path(DATADIR, "Table_S1_pool_gross_edible.csv"))
+write_csv(pool_q1_summary, file.path(DATADIR, "pool_biomass_removal.csv"))
+write_csv(archetype_summary_model, file.path(DATADIR, "archetype_summary.csv"))
+
+
+# ============================================================================
+# 3. INDIVIDUAL REMOVAL AND ARCHETYPE COMPARISON
+# ============================================================================
+
+B_low <- sum(pool_biomass$biomass_low)
+B_mid <- sum(pool_biomass$biomass_mid)
+B_high <- sum(pool_biomass$biomass_high)
+
+bird_q3 <- bird_archetype_removal %>%
+  transmute(
+    bird_id,
+    bird_type = paste0("Bird ", bird_id),
+    archetype,
+    visit_location_counts,
+    pool_bird_visit_days,
+    unique_active_days,
+    n_unique_pools_visited,
+    pools_visited,
+    pct_days_active = 100 * unique_active_days / D,
+    total_removal_low_kg = removal_low_kg,
+    total_removal_mid_kg = removal_mid_kg,
+    total_removal_high_kg = removal_high_kg,
+    pct_biomass_removed_mid = 100 * removal_mid_kg / B_mid,
+    is_hypothetical = FALSE
+  )
+
+# The hypothetical user is a mathematical upper bound, not an observed bird.
 hypothetical_daily <- tibble(
-  bird_id               = NA_real_,
-  total_fixes           = D,
-  total_days            = D,
-  n_unique_pools        = NA_integer_,  # update with number of pools your vultures visited
-  pools_visited         = "update with pool IDs your vultures used",
-  archetype             = "Hypothetical daily user",
-  total_removal_low_kg  = D * U_low,
-  total_removal_mid_kg  = D * U_mid,
+  bird_id = NA_real_,
+  bird_type = "Hypothetical daily user",
+  archetype = "Hypothetical daily user",
+  visit_location_counts = NA_integer_,
+  pool_bird_visit_days = NA_integer_,
+  unique_active_days = D,
+  n_unique_pools_visited = NA_integer_,
+  pools_visited = NA_character_,
+  pct_days_active = 100,
+  total_removal_low_kg = D * U_low,
+  total_removal_mid_kg = D * U_mid,
   total_removal_high_kg = D * U_high,
-  pct_days_active       = 100,
-  pct_biomass_removed_mid = round(100 * (D * U_mid) / B_mid, 4),
-  is_hypothetical       = TRUE
+  pct_biomass_removed_mid = 100 * D * U_mid / B_mid,
+  is_hypothetical = TRUE
 )
 
 bird_q3_full <- bind_rows(bird_q3, hypothetical_daily)
+# Mean per-bird removal ratio used in the Abstract and Discussion.
+comparison <- archetype_summary_model %>%
+  filter(archetype %in% c("Super user", "Moderate user")) %>%
+  select(archetype, mean_days_active, mean_removal_mid_kg)
+super_kg <- comparison$mean_removal_mid_kg[comparison$archetype == "Super user"]
+moderate_kg <- comparison$mean_removal_mid_kg[comparison$archetype == "Moderate user"]
+stopifnot(length(super_kg) == 1, length(moderate_kg) == 1, moderate_kg > 0)
 
-cat("=== FULL BIRD ARCHETYPE REMOVAL TABLE (including hypothetical user) ===\n")
-print(bird_q3_full %>%
-        select(bird_id, archetype, total_fixes, total_days,
-               n_unique_pools, pct_days_active,
-               total_removal_low_kg, total_removal_mid_kg,
-               total_removal_high_kg, pct_biomass_removed_mid),
-      n = Inf)
-```
+write_csv(bird_q3_full, file.path(DATADIR, "bird_modeled_removal.csv"))
 
-```{r step3-correlations}
-# ── DESCRIPTIVE SPEARMAN CORRELATIONS ─────────────────────────────────────────
-# Spearman rank correlation used given small sample sizes and because
-# the active-days metric is structurally linked to modeled removal.
-# Results are descriptive only — not formal statistical tests.
 
-obs_birds <- bird_q3 %>% filter(!is_hypothetical)
+# ============================================================================
+# 4. BIOMASS / INTAKE SENSITIVITY GRIDS (S2 AND S3)
+# ============================================================================
 
-cor_fixes  <- cor(obs_birds$total_fixes,      obs_birds$total_removal_mid_kg, method = "spearman")
-cor_days   <- cor(obs_birds$total_days,        obs_birds$total_removal_mid_kg, method = "spearman")
-cor_pools  <- cor(obs_birds$n_unique_pools,    obs_birds$total_removal_mid_kg, method = "spearman")
-
-cat("=== DESCRIPTIVE CORRELATIONS (observed birds only) ===\n")
-cat(sprintf("Spearman r — total fixes vs removal (mid):      %.3f\n", cor_fixes))
-cat(sprintf("Spearman r — days active vs removal (mid):      %.3f\n", cor_days))
-cat(sprintf("Spearman r — unique pools vs removal (mid):     %.3f\n", cor_pools))
-cat("Note: Descriptive only — not interpreted as formal statistical tests.\n")
-
-# ── SAVE ──────────────────────────────────────────────────────────────────────
-write_csv(bird_q3_full,       file.path(DATADIR, "output_bird_archetype_removal_full.csv"))
-write_csv(archetype_summary,  file.path(DATADIR, "output_archetype_removal_summary.csv"))
-cat("\nSaved: output_bird_archetype_removal_full.csv\n")
-cat("Saved: output_archetype_removal_summary.csv\n")
-```
-
----
-
-# Step 4: Vultures needed to reach biomass removal thresholds
-
-**Purpose:** Estimate how many vultures of each behavioral archetype would be required to remove 10%, 20%, and 50% of total outbreak biomass over the analysis window, assuming vultures acted as the sole scavenger guild. Run sensitivity analyses across all combinations of body-mass and intake-rate scenarios.
-
-**Note:** Because epidemiological thresholds for scavenger-mediated carcass removal sufficient to interrupt disease transmission are unknown, these are operational reference benchmarks rather than validated epidemiological targets. Adjust threshold percentages to suit your study system.
-
-```{r step4-setup}
-# ── SCENARIO GRID ─────────────────────────────────────────────────────────────
 biomass_scenarios <- tibble(
-  biomass_scenario = c("Low", "Mid", "High"),
-  total_biomass_kg = c(B_low, B_mid, B_high)
+  biomass_scenario = c("High", "Mid", "Low"),
+  hippo_mass_kg = c(M_high, M_mid, M_low),
+  gross_biomass_kg = c(sum(pool_biomass$biomass_high),
+                       sum(pool_biomass$biomass_mid),
+                       sum(pool_biomass$biomass_low))
 )
-
 intake_scenarios <- tibble(
-  intake_scenario = c("Low", "Mid", "High"),
-  intake_rate_kg  = c(U_low, U_mid, U_high)
+  intake_scenario = c("High", "Mid", "Low"),
+  intake_rate_kg = c(U_high, U_mid, U_low)
 )
+thresholds <- tibble(threshold_pct = c(20, 50, 80))
 
-# Adjust removal thresholds as appropriate for your study system
-thresholds <- tibble(
-  threshold_pct   = c(10, 20, 50),
-  threshold_label = c("10%", "20%", "50%")
-)
+archetype_days <- archetype_summary_model %>%
+  filter(archetype %in% c("Super user", "Moderate user")) %>%
+  select(archetype, mean_days_active) %>%
+  bind_rows(tibble(archetype = "Hypothetical daily user",
+                   mean_days_active = as.numeric(D)))
 
-# ── ARCHETYPE MEAN ACTIVE DAYS ────────────────────────────────────────────────
-archetype_days <- archetype_summary %>%
-  filter(archetype != "Hypothetical daily user") %>%
-  select(archetype, mean_days_active)
+make_benchmark <- function(edible = FALSE) {
+  fraction <- if (edible) EDIBLE_FRACTION else 1
+  archetype_days %>%
+    cross_join(biomass_scenarios) %>%
+    cross_join(intake_scenarios) %>%
+    cross_join(thresholds) %>%
+    mutate(
+      biomass_basis = if (edible) "Edible" else "Gross",
+      total_biomass_kg = gross_biomass_kg * fraction,
+      target_removal_kg = total_biomass_kg * threshold_pct / 100,
+      removal_per_bird_kg = mean_days_active * intake_rate_kg,
+      n_vultures_needed = ceiling(target_removal_kg / removal_per_bird_kg)
+    ) %>%
+    select(biomass_basis, archetype, mean_days_active,
+           biomass_scenario, hippo_mass_kg, total_biomass_kg,
+           intake_scenario, intake_rate_kg, threshold_pct,
+           target_removal_kg, removal_per_bird_kg, n_vultures_needed) %>%
+    arrange(archetype, threshold_pct, desc(hippo_mass_kg),
+            desc(intake_rate_kg))
+}
 
-archetype_days <- bind_rows(
-  archetype_days,
-  tibble(archetype = "Hypothetical daily user", mean_days_active = as.numeric(D))
-)
+S2_gross <- make_benchmark(FALSE)
+S3_edible <- make_benchmark(TRUE)
+stopifnot(nrow(S2_gross) == 81L, nrow(S3_edible) == 81L,
+          all(S2_gross$n_vultures_needed * S2_gross$removal_per_bird_kg >=
+                S2_gross$target_removal_kg - 1e-8),
+          all(S3_edible$n_vultures_needed * S3_edible$removal_per_bird_kg >=
+                S3_edible$target_removal_kg - 1e-8))
 
-cat("=== ARCHETYPE MEAN ACTIVE DAYS ===\n")
-print(archetype_days)
-```
 
-```{r step4-calculate}
-# ── CORE CALCULATION ──────────────────────────────────────────────────────────
-# For each archetype x biomass scenario x intake scenario x threshold:
-# removal per bird = mean active days x daily intake rate
-# vultures needed  = ceiling(target biomass / removal per bird)
-# Non users excluded (removal capacity undefined at 0 active days)
 
-step4_results <- archetype_days %>%
-  cross_join(biomass_scenarios) %>%
-  cross_join(intake_scenarios)  %>%
-  cross_join(thresholds)        %>%
-  mutate(
-    removal_per_bird_kg = mean_days_active * intake_rate_kg,
-    target_removal_kg   = total_biomass_kg * (threshold_pct / 100),
-    n_vultures_needed   = ifelse(
-      removal_per_bird_kg == 0,
-      NA_real_,
-      ceiling(target_removal_kg / removal_per_bird_kg)
-    ),
-    total_removal_all_kg = n_vultures_needed * removal_per_bird_kg,
-    actual_pct_removed   = round(100 * total_removal_all_kg / total_biomass_kg, 2)
-  ) %>%
-  select(archetype, mean_days_active,
-         biomass_scenario, total_biomass_kg,
-         intake_scenario, intake_rate_kg,
-         threshold_label, threshold_pct,
-         target_removal_kg, removal_per_bird_kg,
-         n_vultures_needed, total_removal_all_kg, actual_pct_removed) %>%
-  arrange(archetype, threshold_pct, biomass_scenario, intake_scenario)
+# ============================================================================
+# 5. FINAL FIGURES: GROSS PRIMARY AND EDIBLE SENSITIVITY
+# These figures use the same unrounded archetype means as Tables S2 and S3.
+# Limited users are shown in figures but excluded from S2/S3, as in .
+# ============================================================================
 
-# ── MIDPOINT SCENARIO SUMMARY ─────────────────────────────────────────────────
-step4_mid <- step4_results %>%
-  filter(biomass_scenario == "Mid", intake_scenario == "Mid") %>%
-  select(archetype, mean_days_active, threshold_label,
-         target_removal_kg, removal_per_bird_kg, n_vultures_needed)
+B_gross  <- sum(pool_biomass$biomass_mid)
+B_edible <- B_gross * EDIBLE_FRACTION
 
-cat("=== MIDPOINT SCENARIO SUMMARY ===\n")
-print(step4_mid, n = Inf)
+figure_archetypes <- archetype_summary_model %>%
+  select(archetype, mean_days_active) %>%
+  bind_rows(
+    tibble(archetype = "Hypothetical daily user",
+           mean_days_active = as.numeric(D))
+  )
 
-# ── SENSITIVITY TABLE ─────────────────────────────────────────────────────────
-step4_sensitivity <- step4_results %>%
-  mutate(scenario_combo = paste0(biomass_scenario, " biomass | ", intake_scenario, " intake")) %>%
-  select(archetype, threshold_label, scenario_combo, n_vultures_needed) %>%
-  pivot_wider(names_from = scenario_combo, values_from = n_vultures_needed) %>%
-  arrange(archetype, threshold_label)
-
-cat("\n=== SENSITIVITY TABLE: VULTURES NEEDED (all scenario combinations) ===\n")
-print(step4_sensitivity, n = Inf)
-
-# ── NARRATIVE ─────────────────────────────────────────────────────────────────
-cat("\n=== NARRATIVE (midpoint scenario) ===\n")
-step4_mid %>%
-  filter(!is.na(n_vultures_needed)) %>%
-  rowwise() %>%
-  mutate(line = sprintf(
-    "To remove %s of outbreak biomass (%.0f kg): %.0f %s birds needed | %.2f kg/bird over %.1f active days",
-    threshold_label, target_removal_kg, n_vultures_needed,
-    archetype, removal_per_bird_kg, mean_days_active
-  )) %>%
-  pull(line) %>%
-  cat(sep = "\n")
-
-# ── SAVE ──────────────────────────────────────────────────────────────────────
-write_csv(step4_results,     file.path(DATADIR, "output_step4_vultures_needed_full.csv"))
-write_csv(step4_sensitivity, file.path(DATADIR, "output_step4_sensitivity_table.csv"))
-cat("\nSaved: output_step4_vultures_needed_full.csv\n")
-cat("Saved: output_step4_sensitivity_table.csv\n")
-```
-
-```{r step4-plot}
-# ── PLOT: VULTURES NEEDED BY ARCHETYPE AND THRESHOLD ─────────────────────────
-# Colorblind-safe Okabe-Ito palette
-# Update archetype_order and arch_colors to match your archetypes
-
-archetype_order <- c("Moderate user", "Super user", "Hypothetical daily user")
-
-arch_colors <- c(
-  "Hypothetical daily user" = "#0072B2",   # blue
-  "Super user"              = "#009E73",   # bluish green
-  "Moderate user"           = "#E69F00"    # orange
-  # Add or adjust colors for additional archetypes
+archetype_order <- c(
+  "Limited user", "Moderate user", "Super user", "Hypothetical daily user"
 )
 
 archetype_labels <- c(
   "Hypothetical daily user" = "Hypothetical\ndaily user",
-  "Super user"              = "Super user",
-  "Moderate user"           = "Moderate user"
+  "Super user" = "Super user",
+  "Moderate user" = "Moderate user",
+  "Limited user" = "Limited user"
 )
 
-threshold_labeller <- as_labeller(c(
-  "10%" = "10% removal",
-  "20%" = "20% removal",
-  "50%" = "50% removal"
-  # Update labels if you use different thresholds
-))
-
-plot_data <- step4_results %>%
-  filter(
-    biomass_scenario == "Mid",
-    intake_scenario  == "Mid",
-    !is.na(n_vultures_needed),
-    archetype != "Non user"
-  ) %>%
-  mutate(
-    archetype       = factor(archetype, levels = archetype_order),
-    threshold_label = factor(threshold_label, levels = c("10%", "20%", "50%"))
-  )
-
-step4_plot <- ggplot(
-  plot_data,
-  aes(x = archetype, y = n_vultures_needed, fill = archetype)
-) +
-  geom_col(width = 0.55, alpha = 0.92) +
-  geom_text(
-    aes(label = comma(round(n_vultures_needed))),
-    hjust = -0.15, size = 3.6, fontface = "bold", color = "grey15"
-  ) +
-  coord_flip(clip = "off") +
-  facet_wrap(~threshold_label, ncol = 3, labeller = threshold_labeller, scales = "free_x") +
-  scale_x_discrete(labels = archetype_labels) +
-  scale_y_continuous(labels = comma, expand = expansion(mult = c(0, 0.28))) +
-  scale_fill_manual(values = arch_colors) +
-  labs(
-    title   = "Vultures required to reach outbreak biomass removal thresholds",
-    subtitle = "Sole scavenger assumption | Midpoint biomass and intake scenario",
-    x       = NULL,
-    y       = "Vultures needed",
-    caption = "Sensitivity range reported in supplementary table. Ceiling applied: fractional birds rounded up."
-  ) +
-  theme_minimal(base_size = 12) +
-  theme(
-    plot.title        = element_text(face = "bold", size = 13.5, margin = margin(b = 5)),
-    plot.subtitle     = element_text(size = 9, color = "grey35", margin = margin(b = 14)),
-    plot.caption      = element_text(size = 7.5, color = "grey50", hjust = 0, margin = margin(t = 10)),
-    plot.background   = element_rect(fill = "white", color = NA),
-    strip.text        = element_text(face = "bold", size = 10.5),
-    strip.background  = element_rect(fill = "#F0F0F0", color = NA),
-    panel.grid.major.y = element_blank(),
-    panel.grid.minor   = element_blank(),
-    panel.grid.major.x = element_line(color = "grey90", linewidth = 0.45),
-    panel.spacing     = unit(1.4, "lines"),
-    axis.text.y       = element_text(size = 10, face = "bold", color = "grey20"),
-    axis.text.x       = element_text(size = 8, color = "grey45"),
-    legend.position   = "none"
-  )
-
-print(step4_plot)
-
-ggsave(
-  file.path(DATADIR, "output_step4_vultures_needed_plot.png"),
-  step4_plot, width = 11, height = 4.2, dpi = 300, bg = "white"
+arch_colors <- c(
+  "Hypothetical daily user" = "#CC79A7",
+  "Super user" = "#E69F00",
+  "Moderate user" = "#009E73",
+  "Limited user" = "#0072B2"
 )
-cat("Saved: output_step4_vultures_needed_plot.png\n")
-```
 
----
+stopifnot(
+  nrow(figure_archetypes) == 4L,
+  setequal(figure_archetypes$archetype, archetype_order),
+  all(figure_archetypes$mean_days_active > 0)
+)
 
-# Session Info
+make_biomass_figure <- function(total_biomass, biomass_type, filename) {
+  plot_data <- figure_archetypes %>%
+    crossing(threshold_pct = c(20, 50, 80)) %>%
+    mutate(
+      target_removal_kg = total_biomass * threshold_pct / 100,
+      removal_per_bird_kg = mean_days_active * U_mid,
+      n_vultures_needed = ceiling(target_removal_kg / removal_per_bird_kg),
+      archetype = factor(archetype, levels = archetype_order),
+      threshold_label = factor(paste0(threshold_pct, "%"),
+                               levels = c("20%", "50%", "80%"))
+    )
 
-```{r session-info}
-sessionInfo()
-```
+  output_table <- plot_data %>%
+    mutate(
+      archetype = as.character(archetype),
+      threshold = paste0(threshold_pct, "% removal")
+    ) %>%
+    select(archetype, threshold, n_vultures_needed) %>%
+    pivot_wider(names_from = threshold, values_from = n_vultures_needed) %>%
+    arrange(match(archetype, rev(archetype_order)))
+
+  threshold_labels <- setNames(
+    paste0(
+      c("20%", "50%", "80%"), " removal\n(~",
+      scales::comma(total_biomass * c(0.20, 0.50, 0.80), accuracy = 1),
+      " kg)"
+    ),
+    c("20%", "50%", "80%")
+  )
+
+  figure_title <- if (biomass_type == "Gross") {
+    "Vultures required to reach gross biomass removal thresholds (100%)"
+  } else {
+    "Vultures required to reach edible biomass removal thresholds (55%; Houston 1979)"
+  }
+
+  subtitle_text <- paste0(
+    biomass_type, " carcass biomass (~",
+    scales::comma(round(total_biomass)), " kg)  |  ",
+    D, "-day outbreak window"
+  )
+
+  p <- ggplot(
+    plot_data,
+    aes(x = archetype, y = n_vultures_needed, fill = archetype)
+  ) +
+    geom_col(width = 0.55, alpha = 0.92) +
+    geom_text(
+      aes(label = scales::comma(n_vultures_needed)),
+      hjust = -0.15, size = 3.6, fontface = "bold", color = "grey15"
+    ) +
+    coord_flip(clip = "off") +
+    facet_wrap(
+      ~threshold_label,
+      ncol = 3,
+      labeller = as_labeller(threshold_labels),
+      scales = "free_x"
+    ) +
+    scale_x_discrete(labels = archetype_labels) +
+    scale_y_continuous(
+      labels = scales::comma,
+      expand = expansion(mult = c(0, 0.35)),
+      breaks = scales::breaks_pretty(n = 3)
+    ) +
+    scale_fill_manual(values = arch_colors) +
+    labs(title = figure_title, subtitle = subtitle_text,
+         x = NULL, y = "Vultures needed") +
+    theme_minimal(base_size = 12) +
+    theme(
+      plot.title = element_text(
+        face = "bold", size = 13.5, margin = margin(b = 5)
+      ),
+      plot.subtitle = element_text(
+        size = 9, color = "grey35", margin = margin(b = 14)
+      ),
+      plot.background = element_rect(fill = "white", color = NA),
+      plot.margin = margin(15, 35, 15, 15),
+      strip.text = element_text(face = "bold", size = 10.5),
+      strip.background = element_rect(fill = "#F0F0F0", color = NA),
+      panel.grid.major.y = element_blank(),
+      panel.grid.minor = element_blank(),
+      panel.grid.major.x = element_line(color = "grey90", linewidth = 0.45),
+      panel.spacing = grid::unit(2.3, "lines"),
+      axis.text.y = element_text(size = 10, color = "grey20"),
+      axis.text.x = element_text(
+        size = 8, color = "grey45", angle = 30, hjust = 1
+      ),
+      legend.position = "none"
+    )
+
+  ggsave(file.path(DATADIR, paste0(filename, ".png")),
+         plot = p, width = 15, height = 6, dpi = 300, bg = "white")
+  ggsave(file.path(DATADIR, paste0(filename, ".pdf")),
+         plot = p, width = 15, height = 6, bg = "white")
+  write_csv(output_table, file.path(DATADIR, paste0(filename, "_table.csv")))
+  write_csv(plot_data, file.path(DATADIR, paste0(filename, "_plot_data.csv")))
+  invisible(list(figure = p, table = output_table, data = plot_data))
+}
+
+# Figure 8 in main manuscript: gross carcass biomass (100%).
+gross_results <- make_biomass_figure(
+  total_biomass = B_gross,
+  biomass_type = "Gross",
+  filename = "Figure8_GROSS"
+)
+
+# Supplementary figure: edible carcass biomass (55%).
+edible_results <- make_biomass_figure(
+  total_biomass = B_edible,
+  biomass_type = "Edible",
+  filename = "Figure8_EDIBLE"
+)
+
+# ============================================================================
+# 6. EXPORT SUPPLEMENTARY TABLES AND REPRODUCIBILITY CHECKS
+# ============================================================================
+
+write_csv(S2_gross, file.path(DATADIR, "Table_S2_GROSS.csv"))
+write_csv(S3_edible, file.path(DATADIR, "Table_S3_EDIBLE.csv"))
+
+# These are checks against the 2017 analysis, not inputs to the model.
+stopifnot(
+  nrow(S2_gross) == 81L,
+  nrow(S3_edible) == 81L,
+  abs(B_gross - 97887) < 1e-8,
+  abs(B_edible - 53837.85) < 1e-6,
+  bird_day_audit$unique_bird_days == 112L,
+  bird_day_audit$pool_bird_days == 114L,
+  abs(sum(bird_archetype_removal$removal_mid_kg) - 56) < 1e-8,
+  abs(super_kg / moderate_kg - (33.5 / 10.75)) < 1e-10,
+  gross_results$table$`50% removal`[
+    gross_results$table$archetype == "Super user"] == 2922,
+  gross_results$table$`50% removal`[
+    gross_results$table$archetype == "Moderate user"] == 9106,
+  edible_results$table$`50% removal`[
+    edible_results$table$archetype == "Super user"] == 1608
+)
+
+cat("\nAnalysis complete.\n")
+cat("Outbreak window:", D, "days | Pool-bird visit-days:",
+    bird_day_audit$pool_bird_days,
+    "| Unique active bird-calendar-days:", bird_day_audit$unique_bird_days, "\n")
+cat("Gross biomass:", B_gross, "kg | Edible biomass:", B_edible, "kg\n")
+cat("Observed midpoint modeled removal:",
+    sum(bird_archetype_removal$removal_mid_kg), "kg\n")
+cat(sprintf("Super/moderate modeled removal per bird: %.3f x\n",
+            super_kg / moderate_kg))
+cat("Figures and tables saved to:", normalizePath(DATADIR), "\n")
