@@ -1,4 +1,4 @@
-# Anthrax-and-Carnivores
+# Anthrax-and-Scavengers
 Published code for carnivore anthrax mitigation
 
 Code in this repository is affiliated with math and epi models incorporating carnivores into anthrax outbreaks. Manuscripts affiliated with this repository include:
